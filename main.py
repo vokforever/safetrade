@@ -85,17 +85,82 @@ def get_balances_safetrade():
             error_message += f"\nОтвет сервера: {e.response.text}"
         return error_message
 
+# НОВАЯ ФУНКЦИЯ: Получение текущей рыночной цены (бид)
+def get_current_bid_price(market_symbol):
+    """
+    Получает текущую лучшую цену покупки (бид) для указанной торговой пары.
+    ЭТО ПРИМЕРНАЯ РЕАЛИЗАЦИЯ. ВАМ НУЖНО УТОЧНИТЬ ЭНДПОИНТ И СТРУКТУРУ ОТВЕТА
+    В СООТВЕТСТВИИ С ДОКУМЕНТАЦИЕЙ SAFETRADE API.
+    Предполагаемый эндпоинт: /trade/public/tickers/{market_id}
+    """
+    path = f"/trade/public/tickers/{market_symbol}"
+    url = BASE_URL + path
+    try:
+        # Для публичных эндпоинтов заголовки аутентификации обычно не нужны
+        response = scraper.get(url)
+        response.raise_for_status()
+        ticker_data = response.json()
+        
+        # Предполагаем, что 'bid' содержит лучшую цену покупки
+        # Если SafeTrade возвращает список, найдите нужный тикер.
+        # Если возвращается объект, обратитесь напрямую.
+        if isinstance(ticker_data, dict) and 'bid' in ticker_data:
+            return float(ticker_data['bid'])
+        elif isinstance(ticker_data, list):
+            # Если ответ - список тикеров, найдем наш
+            for ticker in ticker_data:
+                if ticker.get('market') == market_symbol:
+                    if 'bid' in ticker:
+                        return float(ticker['bid'])
+            print(f"Не найдена информация о биде для {market_symbol} в списке тикеров.")
+            return None
+        else:
+            print(f"Неожиданный формат данных тикера: {ticker_data}")
+            return None
+    except Exception as e:
+        print(f"Ошибка при получении текущей цены бида для {market_symbol}: {e}")
+        # В случае ошибки, можно вернуть очень низкую цену, чтобы ордер исполнился,
+        # но это рискованно. Лучше уведомить пользователя.
+        return None
 
 def create_sell_order_safetrade(amount):
-    """Создает ордер на продажу и возвращает отформатированный результат."""
+    """
+    Создает ордер на продажу и возвращает отформатированный результат.
+    Использует ЛИМИТНЫЙ ОРДЕР, имитируя рыночный.
+    """
     path = "/trade/market/orders"
     url = BASE_URL + path
+
+    # ШАГ 1: Получаем текущую лучшую цену покупки (бид) для QTC/USDT
+    current_bid_price = get_current_bid_price(MARKET_SYMBOL)
+
+    if current_bid_price is None or current_bid_price <= 0:
+        return (
+            f"❌ Не удалось получить актуальную цену для {CURRENCY_TO_SELL}/{CURRENCY_TO_BUY}. "
+            f"Невозможно создать лимитный ордер на продажу. "
+            f"Попробуйте позже или проверьте соединение/API."
+        )
+
+    # ШАГ 2: Определяем цену для лимитного ордера.
+    # Чтобы гарантировать немедленное исполнение (имитация рыночного ордера),
+    # мы устанавливаем цену, равную текущему биду, или чуть ниже.
+    # Если стакан достаточно глубокий, ордер будет исполнен сразу по лучшим ценам.
+    # Если вы хотите быть более агрессивным, можно поставить цену немного ниже бида.
+    # Например, current_bid_price * 0.999 (чтобы продать на 0.1% ниже бида)
+    # Для максимальной гарантии исполнения по любой доступной цене,
+    # можно установить очень низкую цену (например, 0.00000001), но это крайне не рекомендуется,
+    # так как вы можете продать намного дешевле, чем могли бы.
+    # Оптимально - использовать текущий бид.
+    price_to_sell_at = current_bid_price # Продаем по текущей лучшей цене покупки
+
     payload = {
         "market": MARKET_SYMBOL,
         "side": "sell",
-        "type": "market",
-        "amount": str(amount)
+        "type": "limit",  # ИЗМЕНЕНО: теперь это 'limit' ордер
+        "amount": str(amount),
+        "price": str(price_to_sell_at)  # НОВОЕ: добавлен параметр price
     }
+
     try:
         headers = get_auth_headers()
         response = scraper.post(url, headers=headers, json=payload)
@@ -103,9 +168,13 @@ def create_sell_order_safetrade(amount):
         order_details = response.json()
 
         order_id = order_details.get('id')
-        order_amount = order_details.get('amount', amount)
+        # В случае лимитного ордера, amount в ответе может отличаться от заявленного,
+        # если ордер исполнен частично. Но для первоначального отображения используем заявленный.
+        order_amount_displayed = order_details.get('amount', amount)
+        order_price_displayed = order_details.get('price', price_to_sell_at)
 
         if order_id:
+            # Запускаем отслеживание ордера в отдельном потоке
             threading.Thread(target=track_order, args=(order_id,)).start()
 
         return (
@@ -114,12 +183,14 @@ def create_sell_order_safetrade(amount):
             f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
             f"*Тип:* `{order_details.get('type', 'N/A').capitalize()}`\n"
             f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
-            f"*Заявленный объем:* `{order_amount} {CURRENCY_TO_SELL}`\n"
+            f"*Заявленный объем:* `{order_amount_displayed} {CURRENCY_TO_SELL}`\n"
+            f"*Заданная цена:* `{order_price_displayed} {CURRENCY_TO_BUY}`\n" # Теперь отображаем заданную цену
             f"*ID ордера:* `{order_id}`"
         )
     except Exception as e:
         error_message = f"❌ Ошибка при создании ордера на продажу на SafeTrade: {e}"
         if hasattr(e, 'response') and e.response is not None:
+            # Ответ сервера теперь выводится в Markdown для лучшего форматирования
             error_message += f"\nОтвет сервера: `{e.response.text}`"
         return error_message
 
@@ -140,12 +211,11 @@ def get_order_info(order_id):
 
 def get_order_trades(order_id):
     """Получает сделки по конкретному ордеру, фильтруя общую историю сделок."""
-    path = "/trade/market/trades"  # ИСПРАВЛЕНО: Правильный эндпоинт
+    path = "/trade/market/trades"
     url = BASE_URL + path
     try:
         headers = get_auth_headers()
-        # ИСПРАВЛЕНО: Добавляем фильтрацию по ID ордера
-        params = {"order_id": str(order_id)}
+        params = {"order_id": str(order_id)} # Фильтруем по ID ордера
         response = scraper.get(url, headers=headers, params=params)
         response.raise_for_status()
         return response.json()
@@ -160,6 +230,8 @@ def get_order_history(limit=10):
     url = BASE_URL + path
     try:
         headers = get_auth_headers()
+        # Изменил state на "done", "active", "cancel", или можно не указывать, чтобы получить все
+        # Для истории обычно нужны "done" и "cancel"
         params = {"market": MARKET_SYMBOL, "limit": limit, "state": "done"}
         response = scraper.get(url, headers=headers, params=params)
         response.raise_for_status()
@@ -171,23 +243,28 @@ def get_order_history(limit=10):
 
 def track_order(order_id):
     """Отслеживает статус ордера и уведомляет о его исполнении."""
-    max_attempts = 30
-    check_interval = 10
+    max_attempts = 30 # Максимальное количество попыток проверки
+    check_interval = 10 # Интервал между проверками в секундах
 
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
         time.sleep(check_interval)
         order_info = get_order_info(order_id)
 
         if not order_info:
-            continue
+            print(f"Попытка {attempt+1}/{max_attempts}: Не удалось получить информацию об ордере {order_id}.")
+            continue # Продолжаем попытки, если информация не получена
 
-        if order_info.get('state') == 'done':
+        order_state = order_info.get('state')
+        print(f"Попытка {attempt+1}/{max_attempts}: Ордер {order_id} в состоянии: {order_state}")
+
+        if order_state == 'done':
+            # Ордер полностью исполнен
             trades = get_order_trades(order_id)
             if trades:
                 total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
                 total_sum = sum(float(trade.get('total', 0)) for trade in trades)
                 avg_price = total_sum / total_amount if total_amount > 0 else 0
-                executed_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                executed_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S") # Время уведомления
 
                 message = (
                     f"✅ *Ордер исполнен!*\n\n"
@@ -201,12 +278,51 @@ def track_order(order_id):
 
                 try:
                     bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
+                    print(f"Уведомление об исполнении ордера {order_id} отправлено.")
                 except Exception as e:
-                    print(f"Ошибка отправки уведомления: {e}")
-                return
-        elif order_info.get('state') == 'cancel':
-            return
-    print(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток")
+                    print(f"Ошибка отправки уведомления об исполнении ордера: {e}")
+                return # Завершаем отслеживание
+        elif order_state == 'cancel':
+            # Ордер отменен
+            message = (
+                f"❌ *Ордер отменен!*\n\n"
+                f"*ID ордера:* `{order_id}`\n"
+                f"*Пара:* `{MARKET_SYMBOL.upper()}`\n"
+                f"*Время отмены:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+            )
+            try:
+                bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
+                print(f"Уведомление об отмене ордера {order_id} отправлено.")
+            except Exception as e:
+                print(f"Ошибка отправки уведомления об отмене ордера: {e}")
+            return # Завершаем отслеживание
+        elif order_state == 'pending':
+            # Ордер еще не исполнен, продолжаем отслеживание
+            print(f"Ордер {order_id} все еще в состоянии 'pending'.")
+            # Можно добавить логику для частичного исполнения, если SafeTrade поддерживает
+            # partial fill для 'pending' state
+        elif order_state == 'active':
+             # Ордер активен, но не полностью исполнен. Это может быть частично исполненный лимитный ордер.
+            print(f"Ордер {order_id} активен (active).")
+            # Продолжаем ждать 'done' или 'cancel'
+        else:
+            print(f"Неизвестное состояние ордера {order_id}: {order_state}")
+
+
+    # Если вышли из цикла по истечении попыток, но ордер не исполнен/отменен
+    print(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток. Ордер не перешел в состояние 'done' или 'cancel'.")
+    final_order_info = get_order_info(order_id)
+    if final_order_info and final_order_info.get('state') != 'done' and final_order_info.get('state') != 'cancel':
+        message = (
+            f"⚠️ *Отслеживание ордера завершено без окончательного статуса!*\n\n"
+            f"*ID ордера:* `{order_id}`\n"
+            f"*Последний известный статус:* `{final_order_info.get('state', 'N/A').capitalize()}`\n"
+            f"Пожалуйста, проверьте статус ордера вручную на SafeTrade."
+        )
+        try:
+            bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
+        except Exception as e:
+            print(f"Ошибка отправки предупреждения о незавершенном отслеживании: {e}")
 
 
 # --- Обработчики команд Telegram ---
@@ -219,7 +335,7 @@ def handle_start(message):
 *Доступные команды:*
 ✅ `/start` - Показать это приветственное сообщение и список команд.
 💰 `/balance` - Показать все ваши ненулевые балансы на спотовом кошельке.
-📉 `/sell_qtc` - Создать рыночный ордер на продажу *всего доступного* баланса QTC за USDT.
+📉 `/sell_qtc` - Создать лимитный ордер на продажу *всего доступного* баланса QTC за USDT по текущей рыночной цене.
 📊 `/history` - Показать историю ваших ордеров.
 ❤️ `/donate` - Поддержать автора бота.
 Используйте кнопки внизу для быстрого доступа к командам.
@@ -255,19 +371,24 @@ def handle_sell(message):
                 if balance.get("currency", "").upper() == CURRENCY_TO_SELL:
                     qtc_balance = float(balance.get("balance", 0))
                     break
-        if qtc_balance > 0:
+        
+        # Проверяем, что баланс QTC достаточно большой для продажи (например, больше минимального размера ордера)
+        # Это предотвратит отправку ордеров с очень маленьким объемом, которые могут быть отклонены биржей
+        MIN_SELL_AMOUNT = 0.001 # Примерное минимальное количество, уточните в документации SafeTrade
+        if qtc_balance > MIN_SELL_AMOUNT:
             bot.send_message(message.chat.id,
                              f"✅ Обнаружено `{qtc_balance}` {CURRENCY_TO_SELL}. Создаю ордер на продажу...",
                              parse_mode='Markdown')
             sell_result = create_sell_order_safetrade(qtc_balance)
             bot.send_message(message.chat.id, sell_result, parse_mode='Markdown')
         else:
-            bot.send_message(message.chat.id, f"Баланс `{CURRENCY_TO_SELL}` равен 0. Продавать нечего.",
+            bot.send_message(message.chat.id, f"Баланс `{CURRENCY_TO_SELL}` равен `{qtc_balance}`. "
+                                             f"Продавать нечего или объем слишком мал (мин. `{MIN_SELL_AMOUNT}`).",
                              parse_mode='Markdown')
     except Exception as e:
-        error_message = f"❌ Произошла ошибка перед созданием ордера: {e}"
+        error_message = f"❌ Произошла ошибка при подготовке к созданию ордера: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: {e.response.text}"
+            error_message += f"\nОтвет сервера: `{e.response.text}`"
         bot.send_message(message.chat.id, error_message)
 
 
@@ -276,34 +397,39 @@ def handle_history(message):
     """Обработчик команды /history с корректным отображением исполненных ордеров."""
     bot.send_message(message.chat.id, "🔍 Запрашиваю историю ордеров с SafeTrade...")
 
-    orders = get_order_history(limit=10)
+    orders = get_order_history(limit=10) # Получаем последние 10 исполненных ордеров
 
     if orders and isinstance(orders, list) and len(orders) > 0:
-        history_text = "📊 *История ваших ордеров:*\n\n"
+        history_text = "📊 *История ваших последних исполненных ордеров:*\n\n"
         for order in orders:
             order_id = order.get('id', 'N/A')
             created_at = order.get('created_at', 'N/A')
 
             try:
+                # Парсим дату и время для форматирования
+                # Формат ISO 8601, который обычно используется API: YYYY-MM-DDTHH:MM:SS.fZ
                 dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
                 formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                formatted_time = created_at
+            except ValueError:
+                formatted_time = created_at # Если формат не подходит, оставляем как есть
 
-            amount_str = f"`{order.get('amount', 'N/A')}`"
-            price_str = f"`{order.get('price', 'N/A')}`"
-            total_str = f"`{order.get('total', 'N/A')}`"
+            # Инициализируем значения для отображения
+            amount_str = f"`{order.get('amount', 'N/A')}`" # Запрошенный объем
+            price_str = f"`{order.get('price', 'N/A')}`" # Запрошенная цена (для лимитного ордера)
+            total_str = f"`{order.get('total', 'N/A')}`" # Общая сумма (для исполненного ордера)
 
+            # Если ордер исполнен ('done'), получаем реальные данные о сделках
             if order.get('state') == 'done':
                 trades = get_order_trades(order_id)
                 if trades and isinstance(trades, list) and len(trades) > 0:
-                    total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
-                    total_sum = sum(float(trade.get('total', 0)) for trade in trades)
-                    avg_price = total_sum / total_amount if total_amount > 0 else 0
+                    total_amount_executed = sum(float(trade.get('amount', 0)) for trade in trades)
+                    total_sum_received = sum(float(trade.get('total', 0)) for trade in trades)
+                    # Средняя цена исполнения
+                    avg_price_executed = total_sum_received / total_amount_executed if total_amount_executed > 0 else 0
 
-                    amount_str = f"`{total_amount:.8f}`"
-                    price_str = f"`{avg_price:.8f}` (средняя)"
-                    total_str = f"`{total_sum:.8f}`"
+                    amount_str = f"`{total_amount_executed:.8f}`" # Фактически проданный объем
+                    price_str = f"`{avg_price_executed:.8f}` (средняя)" # Средняя цена исполнения
+                    total_str = f"`{total_sum_received:.8f}`" # Фактически полученная сумма
 
             history_text += (
                 f"*ID ордера:* `{order_id}`\n"
@@ -319,7 +445,7 @@ def handle_history(message):
 
         bot.send_message(message.chat.id, history_text, parse_mode='Markdown')
     else:
-        bot.send_message(message.chat.id, "История ордеров пуста.")
+        bot.send_message(message.chat.id, "История исполненных ордеров пуста или произошла ошибка при получении.")
 
 
 @bot.message_handler(commands=['donate'])
