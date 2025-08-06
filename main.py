@@ -44,6 +44,65 @@ menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 menu_markup.row('/balance', '/sell_qtc')
 menu_markup.row('/history', '/donate')
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: для отправки длинных сообщений в Telegram ---
+def send_long_message(chat_id, text, parse_mode='Markdown'):
+    """
+    Разбивает длинное сообщение на части и отправляет их.
+    Лимит сообщения Telegram для MarkdownV2/HTML составляет 4096 символов.
+    """
+    if not text:
+        return
+
+    # Безопасный лимит, чтобы избежать проблем с кодировкой и форматированием
+    MAX_MESSAGE_LENGTH = 4000 
+
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        try:
+            bot.send_message(chat_id, text, parse_mode=parse_mode)
+        except Exception as e:
+            print(f"Ошибка при отправке короткого сообщения: {e}")
+        return
+
+    # Попытка разбить сообщение по строкам, чтобы сохранить читаемость
+    lines = text.split('\n')
+    current_message_parts = []
+    current_length = 0
+
+    for line in lines:
+        # Если добавление следующей строки превысит лимит, отправляем текущую часть
+        # и начинаем новое сообщение. +1 для символа новой строки.
+        if current_length + len(line) + 1 > MAX_MESSAGE_LENGTH:
+            if current_message_parts: # Убедимся, что есть что отправлять
+                try:
+                    bot.send_message(chat_id, "\n".join(current_message_parts), parse_mode=parse_mode)
+                except Exception as e:
+                    print(f"Ошибка при отправке части сообщения: {e}")
+                current_message_parts = []
+                current_length = 0
+            
+            # Если сама строка слишком длинная, разбиваем ее принудительно
+            if len(line) > MAX_MESSAGE_LENGTH:
+                for i in range(0, len(line), MAX_MESSAGE_LENGTH):
+                    chunk = line[i:i + MAX_MESSAGE_LENGTH]
+                    try:
+                        bot.send_message(chat_id, chunk, parse_mode=parse_mode)
+                    except Exception as e:
+                        print(f"Ошибка при отправке принудительно разбитого куска: {e}")
+            else:
+                # Если строка помещается, но начинает новое сообщение
+                current_message_parts.append(line)
+                current_length += len(line) + 1 # +1 для новой строки
+        else:
+            current_message_parts.append(line)
+            current_length += len(line) + 1 # +1 для новой строки
+
+    # Отправляем оставшиеся части сообщения
+    if current_message_parts:
+        try:
+            bot.send_message(chat_id, "\n".join(current_message_parts), parse_mode=parse_mode)
+        except Exception as e:
+            print(f"Ошибка при отправке последней части сообщения: {e}")
+
 
 # --- Функции API SafeTrade ---
 def generate_signature(nonce, key, secret_bytes):
@@ -77,12 +136,13 @@ def get_balances_safetrade():
         response.raise_for_status() # Вызывает исключение для HTTP ошибок 4xx/5xx
         balances = response.json()
         if isinstance(balances, list):
-            non_zero_balances = [
-                f"{b.get('currency', '').upper()}: `{b.get('balance', '0')}`"
-                for b in balances if float(b.get('balance', 0)) > 0
-            ]
-            if non_zero_balances:
-                return "Ваши ненулевые балансы на SafeTrade:\n\n" + "\n".join(non_zero_balances)
+            non_zero_balances_lines = []
+            for b in balances:
+                if float(b.get('balance', 0)) > 0:
+                    non_zero_balances_lines.append(f"{b.get('currency', '').upper()}: `{b.get('balance', '0')}`")
+            
+            if non_zero_balances_lines:
+                return "Ваши ненулевые балансы на SafeTrade:\n\n" + "\n".join(non_zero_balances_lines)
             else:
                 return "У вас нет ненулевых балансов на SafeTrade."
         else:
@@ -90,15 +150,16 @@ def get_balances_safetrade():
     except Exception as e:
         error_message = f"❌ Ошибка при получении балансов с SafeTrade: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: `{e.response.text}`"
+            # Обрезаем ответ сервера, чтобы он не делал сообщение слишком длинным
+            response_text_truncated = e.response.text[:1000] + ("..." if len(e.response.text) > 1000 else "")
+            error_message += f"\nОтвет сервера: `{response_text_truncated}`"
         return error_message
 
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ: Получение текущей рыночной цены (бид) ---
 def get_current_bid_price(market_symbol):
     """
     Получает текущую лучшую цену покупки (бид) для указанной торговой пары.
-    Использует эндпоинт /trade/public/tickers/{market} из документации SafeTrade API. [1]
+    Использует эндпоинт /trade/public/tickers/{market} из документации SafeTrade API.
     """
     path = f"/trade/public/tickers/{market_symbol}"
     url = BASE_URL + path
@@ -108,8 +169,6 @@ def get_current_bid_price(market_symbol):
         response.raise_for_status() # Вызовет исключение для статусов 4xx/5xx
         ticker_data = response.json()
 
-        # Ожидаем, что API вернет словарь с информацией о конкретном тикере,
-        # содержащий ключ 'bid'
         if isinstance(ticker_data, dict) and 'bid' in ticker_data:
             return float(ticker_data['bid'])
         else:
@@ -119,7 +178,7 @@ def get_current_bid_price(market_symbol):
         print(f"Ошибка при получении текущей цены бида для {market_symbol}: {e}")
         if hasattr(e, 'response') and e.response is not None:
             print(f"Ответ сервера (get_current_bid_price): {e.response.text}")
-        return None # Важно вернуть None, если цену не удалось получить
+        return None
 
 
 def create_sell_order_safetrade(amount):
@@ -143,7 +202,6 @@ def create_sell_order_safetrade(amount):
 
     # ШАГ 2: Определяем цену для лимитного ордера.
     # Для имитации рыночного ордера продаем по текущей лучшей цене покупки (бид).
-    # Это обеспечит почти немедленное исполнение, если в стакане есть покупатели.
     price_to_sell_at = current_bid_price
 
     payload = {
@@ -181,7 +239,9 @@ def create_sell_order_safetrade(amount):
     except Exception as e:
         error_message = f"❌ Ошибка при создании ордера на продажу на SafeTrade: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: `{e.response.text}`"
+            # Обрезаем ответ сервера
+            response_text_truncated = e.response.text[:1000] + ("..." if len(e.response.text) > 1000 else "")
+            error_message += f"\nОтвет сервера: `{response_text_truncated}`"
         return error_message
 
 
@@ -201,7 +261,7 @@ def get_order_info(order_id):
 
 def get_order_trades(order_id):
     """Получает сделки по конкретному ордеру, фильтруя общую историю сделок."""
-    path = "/trade/market/trades" # Корректный эндпоинт [1]
+    path = "/trade/market/trades"
     url = BASE_URL + path
     try:
         headers = get_auth_headers()
@@ -221,7 +281,6 @@ def get_order_history(limit=10):
     url = BASE_URL + path
     try:
         headers = get_auth_headers()
-        # "done" для исполненных, "cancel" для отмененных. Можно убрать state, чтобы получить все.
         params = {"market": MARKET_SYMBOL, "limit": limit, "state": "done"}
         response = scraper.get(url, headers=headers, params=params)
         response.raise_for_status()
@@ -265,32 +324,23 @@ def track_order(order_id):
                     f"*Средняя цена:* `{avg_price:.8f} {CURRENCY_TO_BUY}`\n"
                     f"*Время исполнения:* `{executed_time}`"
                 )
-                try:
-                    bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-                except Exception as e:
-                    print(f"Ошибка отправки уведомления об исполнении ордера {order_id}: {e}")
+                send_long_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
                 return # Завершаем отслеживание
         elif order_state == 'cancel':
             message = (
                 f"❌ *Ордер отменен!*\n\n"
                 f"*ID ордера:* `{order_id}`\n"
                 f"*Пара:* `{MARKET_SYMBOL.upper()}`\n"
-                f"*Причина:* `{order_info.get('reason', 'N/A')}`\n" # Если API предоставляет причину отмены
+                f"*Причина:* `{order_info.get('reason', 'N/A')}`\n"
                 f"*Время отмены:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
             )
-            try:
-                bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-            except Exception as e:
-                print(f"Ошибка отправки уведомления об отмене ордера {order_id}: {e}")
+            send_long_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
             return # Завершаем отслеживание
-        # Если ордер еще pending или active, продолжаем ждать
         elif order_state in ['pending', 'active']:
-            # Можно добавить логику для частичного исполнения здесь, если нужно
             pass
         else:
             print(f"Неизвестное состояние ордера {order_id}: {order_state}")
 
-    # Если вышли из цикла по истечении попыток, но ордер не исполнен/отменен
     print(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток. Ордер не перешел в состояние 'done' или 'cancel'.")
     final_order_info = get_order_info(order_id)
     if final_order_info and final_order_info.get('state') not in ['done', 'cancel']:
@@ -300,10 +350,7 @@ def track_order(order_id):
             f"*Последний известный статус:* `{final_order_info.get('state', 'N/A').capitalize()}`\n"
             f"Пожалуйста, проверьте статус ордера вручную на SafeTrade."
         )
-        try:
-            bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-        except Exception as e:
-            print(f"Ошибка отправки предупреждения о незавершенном отслеживании: {e}")
+        send_long_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
 
 
 # --- НОВАЯ ФУНКЦИЯ: Автоматическая продажа QTC ---
@@ -313,9 +360,21 @@ def auto_sell_qtc():
     """
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Запущена автоматическая проверка для продажи QTC...")
     try:
+        # Убедимся, что все API-ключи доступны перед попыткой продажи
+        if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
+            msg = "[CRITICAL] Не все переменные окружения установлены для автоматической продажи. Пропускаю."
+            print(msg)
+            # Если бот уже запущен, можно отправить уведомление админу
+            try:
+                if ADMIN_CHAT_ID and bot:
+                    send_long_message(ADMIN_CHAT_ID, msg, parse_mode='Markdown')
+            except Exception as e:
+                print(f"Не удалось отправить уведомление админу о недостающих env vars: {e}")
+            return # Завершаем выполнение, если нет ключей
+
         headers = get_auth_headers()
-        response = scraper.get(BASE_URL + "/trade/account/balances/spot", headers=headers)
-        response.raise_for_status()
+        response = scraper.get(url=BASE_URL + "/trade/account/balances/spot", headers=headers)
+        response.raise_for_status() # Вызовет исключение для ошибок 4xx/5xx
         balances = response.json()
         qtc_balance = 0.0
         if isinstance(balances, list):
@@ -328,19 +387,19 @@ def auto_sell_qtc():
             print(f"Обнаружен баланс {qtc_balance} {CURRENCY_TO_SELL}. Инициирую автоматическую продажу.")
             sell_result = create_sell_order_safetrade(qtc_balance)
             # Отправляем уведомление администратору об автоматической продаже
-            bot.send_message(ADMIN_CHAT_ID, f"🔔 *Автоматическая продажа QTC по расписанию:*\n\n{sell_result}", parse_mode='Markdown')
+            send_long_message(ADMIN_CHAT_ID, f"🔔 *Автоматическая продажа QTC по расписанию:*\n\n{sell_result}", parse_mode='Markdown')
         else:
             print(f"Баланс {CURRENCY_TO_SELL} ({qtc_balance}) слишком мал для автоматической продажи (мин. {MIN_SELL_AMOUNT}). Пропускаю.")
     except Exception as e:
         error_message = f"❌ *Произошла ошибка при попытке автоматической продажи QTC:* {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: `{e.response.text}`"
-        bot.send_message(ADMIN_CHAT_ID, error_message, parse_mode='Markdown')
+            # Обрезаем ответ сервера
+            response_text_truncated = e.response.text[:1000] + ("..." if len(e.response.text) > 1000 else "")
+            error_message += f"\nОтвет сервера: `{response_text_truncated}`"
+        send_long_message(ADMIN_CHAT_ID, error_message, parse_mode='Markdown')
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {error_message}")
     finally:
         # Планируем следующий запуск через 1 час (3600 секунд)
-        # Это простой способ планирования, но он не переживает перезапуски бота.
-        # Для более надежного планирования рассмотрите библиотеки вроде APScheduler.
         threading.Timer(3600, auto_sell_qtc).start()
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Следующая автоматическая продажа запланирована через 1 час.")
 
@@ -360,7 +419,7 @@ def handle_start(message):
 ❤️ `/donate` - Поддержать автора бота.
 Используйте кнопки внизу для быстрого доступа к командам.
 """
-    bot.send_message(
+    send_long_message(
         message.chat.id,
         text=welcome_text,
         parse_mode='Markdown',
@@ -373,7 +432,8 @@ def handle_balance(message):
     """Обработчик команды /balance."""
     bot.send_message(message.chat.id, "🔍 Запрашиваю балансы с SafeTrade...")
     balance_info = get_balances_safetrade()
-    bot.send_message(message.chat.id, balance_info, parse_mode='Markdown')
+    # Используем новую вспомогательную функцию для отправки потенциально длинных сообщений
+    send_long_message(message.chat.id, balance_info, parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['sell_qtc'])
@@ -381,8 +441,9 @@ def handle_sell(message):
     """Обработчик команды /sell_qtc."""
     bot.send_message(message.chat.id, f"Ищу `{CURRENCY_TO_SELL}` на балансе для продажи...", parse_mode='Markdown')
     try:
-        headers = get_auth_headers()
-        response = scraper.get(BASE_URL + "/trade/account/balances/spot", headers=headers)
+        # Для получения баланса QTC, нам все равно нужны авторизационные заголовки
+        headers = get_auth_headers() 
+        response = scraper.get(url=BASE_URL + "/trade/account/balances/spot", headers=headers)
         response.raise_for_status()
         balances = response.json()
         qtc_balance = 0.0
@@ -393,20 +454,22 @@ def handle_sell(message):
                     break
         
         if qtc_balance > MIN_SELL_AMOUNT:
-            bot.send_message(message.chat.id,
+            send_long_message(message.chat.id,
                              f"✅ Обнаружено `{qtc_balance}` {CURRENCY_TO_SELL}. Создаю лимитный ордер на продажу по рыночной цене...",
                              parse_mode='Markdown')
             sell_result = create_sell_order_safetrade(qtc_balance)
-            bot.send_message(message.chat.id, sell_result, parse_mode='Markdown')
+            send_long_message(message.chat.id, sell_result, parse_mode='Markdown')
         else:
-            bot.send_message(message.chat.id, f"Баланс `{CURRENCY_TO_SELL}` равен `{qtc_balance}`. "
+            send_long_message(message.chat.id, f"Баланс `{CURRENCY_TO_SELL}` равен `{qtc_balance}`. "
                                              f"Продавать нечего или объем слишком мал (мин. `{MIN_SELL_AMOUNT}`).",
                              parse_mode='Markdown')
     except Exception as e:
         error_message = f"❌ Произошла ошибка перед созданием ордера: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: `{e.response.text}`"
-        bot.send_message(message.chat.id, error_message)
+            # Обрезаем ответ сервера
+            response_text_truncated = e.response.text[:1000] + ("..." if len(e.response.text) > 1000 else "")
+            error_message += f"\nОтвет сервера: `{response_text_truncated}`"
+        send_long_message(message.chat.id, error_message, parse_mode='Markdown')
 
 
 @bot.message_handler(commands=['history'])
@@ -430,7 +493,6 @@ def handle_history(message):
                 formatted_time = created_at # Если формат не подходит, оставляем как есть
 
             # Инициализируем значения для отображения, используя данные из самого ордера
-            # (они могут быть неполными до полного исполнения)
             amount_str = f"`{order.get('amount', 'N/A')}`"
             price_str = f"`{order.get('price', 'N/A')}`"
             total_str = f"`{order.get('total', 'N/A')}`"
@@ -460,9 +522,9 @@ def handle_history(message):
                 f"*Время создания:* `{formatted_time}`\n\n"
             )
 
-        bot.send_message(message.chat.id, history_text, parse_mode='Markdown')
+        send_long_message(message.chat.id, history_text, parse_mode='Markdown')
     else:
-        bot.send_message(message.chat.id, "История исполненных ордеров пуста или произошла ошибка при получении.")
+        send_long_message(message.chat.id, "История исполненных ордеров пуста или произошла ошибка при получении.")
 
 
 @bot.message_handler(commands=['donate'])
@@ -471,7 +533,7 @@ def handle_donate(message):
     donate_markup = types.InlineKeyboardMarkup()
     donate_button = types.InlineKeyboardButton(text="Поддержать автора ❤️", url=DONATE_URL)
     donate_markup.add(donate_button)
-    bot.send_message(
+    send_long_message(
         message.chat.id,
         "Если вы хотите поддержать разработку этого бота, вы можете сделать пожертвование. Спасибо!",
         reply_markup=donate_markup
@@ -497,7 +559,7 @@ if __name__ == "__main__":
         try:
             start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # Отправляем уведомление администратору о запуске бота
-            bot.send_message(
+            send_long_message(
                 ADMIN_CHAT_ID,
                 f"✅ *Бот SafeTrade успешно запущен!*\n\n*Время запуска:* `{start_time}`\nОжидаю команды...",
                 parse_mode='Markdown'
