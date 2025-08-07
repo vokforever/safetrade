@@ -112,10 +112,49 @@ class SafeTradeClient:
             for item in raw_balances:
                 if item.get('currency', '').lower() == currency.lower(): return float(item.get('balance', 0.0))
         return None
+    
+    # НОВЫЙ МЕТОД
+    async def get_trade_history(self, market: str, limit: int = 10) -> str:
+        """Получает историю сделок для указанного рынка."""
+        await self.init()
+        if not self.scraper:
+            return "❌ Не удалось получить историю: клиент не инициализирован."
+        
+        try:
+            url = f"{self.base_url}/trade/market/trades?market={market}&limit={limit}"
+            response = await asyncio.to_thread(self.scraper.get, url, headers=self.get_auth_headers(), timeout=30)
+            
+            if response.status_code == 200:
+                trades = response.json()
+                if not trades:
+                    return f"Пока нет истории сделок для пары <b>{market.upper()}</b>."
+                
+                history_lines = []
+                for trade in trades:
+                    # 'taker_type' показывает, кем вы были в сделке: 'sell' (продали) или 'buy' (купили)
+                    trade_type = "SELL" if trade.get('taker_type') == 'sell' else "BUY"
+                    color = "🔴" if trade_type == "SELL" else "🟢"
+                    
+                    # API возвращает время в формате ISO 8601 с 'Z' на конце
+                    dt_object = datetime.fromisoformat(trade.get('created_at').replace('Z', '+00:00'))
+                    readable_time = dt_object.strftime('%Y-%m-%d %H:%M:%S')
 
-    # НОВЫЙ МЕТОД: для отслеживания ордера
+                    history_lines.append(
+                        f"{color} <b>{trade.get('market').upper()}</b>\n"
+                        f"    <b>Тип:</b> {trade_type}\n"
+                        f"    <b>Кол-во:</b> <code>{trade.get('amount')}</code>\n"
+                        f"    <b>Цена:</b> <code>{trade.get('price')}</code>\n"
+                        f"    <b>Время:</b> <code>{readable_time}</code>"
+                    )
+                return "📈 <b>Последние 10 сделок:</b>\n\n" + "\n".join(history_lines)
+            else:
+                return f"❌ Ошибка получения истории: статус {response.status_code}"
+
+        except Exception as e:
+            logger.error(f"❌ Исключение при получении истории сделок: {e}", exc_info=True)
+            return f"❌ Исключение при получении истории: <code>{e}</code>"
+
     async def get_order_status(self, order_id: int) -> dict | None:
-        """Получает информацию о конкретном ордере по его ID."""
         await self.init()
         if not self.scraper: return None
         try:
@@ -123,31 +162,21 @@ class SafeTradeClient:
             response = await asyncio.to_thread(self.scraper.get, url, headers=self.get_auth_headers(), timeout=30)
             if response.status_code == 200:
                 return response.json()
-            else:
-                logger.error(f"Ошибка получения статуса ордера {order_id}: {response.status_code}")
-                return None
+            return None
         except Exception as e:
             logger.error(f"Исключение при получении статуса ордера {order_id}: {e}")
             return None
 
-    # ИЗМЕНЕННЫЙ МЕТОД: теперь создает MARKET ордер
     async def create_market_sell_order(self, amount: float) -> str:
-        """Создает рыночный (market) ордер на продажу."""
         await self.init()
         if not self.scraper: return "❌ Не удалось создать ордер: клиент не инициализирован."
-        
-        # Для рыночного ордера не нужна цена, только объем
         data = {"market": MARKET_SYMBOL, "side": "sell", "amount": str(amount), "type": "market"}
-        
         try:
             logger.info(f"🔄 Создаю MARKET ордер: {data}")
             response = await asyncio.to_thread(self.scraper.post, f"{self.base_url}/trade/market/orders", headers=self.get_auth_headers(), json=data, timeout=30)
-            
             if response.status_code in [200, 201]:
                 order_details = response.json()
-                logger.info(f"✅ Ордер успешно создан: {order_details}")
                 if 'id' in order_details:
-                    # НОВОЕ: Запускаем фоновое отслеживание ордера
                     asyncio.create_task(self.track_order_execution(order_details['id']))
                     return self.format_order_creation_success(order_details)
                 return f"❌ Неожиданный ответ: <code>{str(order_details)[:200]}</code>"
@@ -156,39 +185,27 @@ class SafeTradeClient:
             logger.error(f"❌ Исключение при создании ордера: {e}", exc_info=True)
             return f"❌ Исключение при создании ордера: <code>{str(e)[:200]}</code>"
 
-    # НОВЫЙ МЕТОД: фоновая задача для отслеживания
     async def track_order_execution(self, order_id: int):
         logger.info(f"Начинаю отслеживание исполнения ордера {order_id}...")
-        max_attempts = 60  # ~10 минут (60 попыток * 10 секунд)
-        
+        max_attempts = 60
         for attempt in range(max_attempts):
-            await asyncio.sleep(10) # Проверяем каждые 10 секунд
-            
+            await asyncio.sleep(10)
             order_info = await self.get_order_status(order_id)
             if not order_info: continue
-
             state = order_info.get('state')
             logger.info(f"Попытка {attempt+1}/{max_attempts}: Ордер {order_id} в состоянии '{state}'")
-
             if state == 'done':
-                filled_amount = order_info.get('executed_volume', 'N/A')
-                avg_price = order_info.get('avg_price', 'N/A')
                 message = (f"✅ <b>Ордер #{order_id} исполнен!</b>\n\n"
-                           f"<b>Продано:</b> <code>{filled_amount} {CURRENCY_TO_SELL}</code>\n"
-                           f"<b>Средняя цена:</b> <code>{avg_price} {CURRENCY_TO_BUY}</code>")
+                           f"<b>Продано:</b> <code>{order_info.get('executed_volume', 'N/A')} {CURRENCY_TO_SELL}</code>\n"
+                           f"<b>Средняя цена:</b> <code>{order_info.get('avg_price', 'N/A')} {CURRENCY_TO_BUY}</code>")
                 await bot.send_message(ADMIN_CHAT_ID, message)
-                return # Задача выполнена
-
+                return
             if state in ['cancel', 'reject']:
-                message = f"❌ <b>Ордер #{order_id} был отменен или отклонен.</b>"
-                await bot.send_message(ADMIN_CHAT_ID, message)
-                return # Задача выполнена
-
-        logger.warning(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток. Статус остался не 'done'.")
+                await bot.send_message(ADMIN_CHAT_ID, f"❌ <b>Ордер #{order_id} был отменен или отклонен.</b>")
+                return
         await bot.send_message(ADMIN_CHAT_ID, f"⚠️ Ордер #{order_id} не был исполнен за 10 минут.")
 
     def format_order_creation_success(self, order: dict) -> str:
-        """Форматирует сообщение о СОЗДАНИИ ордера."""
         return (f"✅ <b>Рыночный ордер на продажу создан!</b>\n\n"
                 f"<b>Пара:</b> <code>{order.get('market', 'N/A').upper()}</code>\n"
                 f"<b>Заявленный объем:</b> <code>{order.get('amount', 'N/A')} {CURRENCY_TO_SELL}</code>\n"
@@ -205,7 +222,6 @@ async def scheduled_sell_task():
         if balance is None or balance <= MIN_SELL_AMOUNT:
             logger.info(f"🗓️ Задача завершена: баланс ({balance or 0}) недостаточен.")
             return
-
         logger.info(f"🗓️ Баланс {balance} {CURRENCY_TO_SELL} достаточен. Создаю рыночный ордер...")
         result_message = await safetrade_client.create_market_sell_order(balance)
         await bot.send_message(ADMIN_CHAT_ID, "📈 <b>Автоматическая продажа:</b>\n\n" + result_message)
@@ -220,7 +236,8 @@ async def handle_start(message: Message):
         "👋 <b>Добро пожаловать!</b>\n\n"
         "<b>Команды:</b>\n"
         "💰 <code>/balance</code> - Показать балансы\n"
-        f"📉 <code>/sell_qtc</code> - Продать весь {CURRENCY_TO_SELL} по рынку\n"
+        "📉 <code>/sell_qtc</code> - Продать весь QTC по рынку\n"
+        "📜 <code>/history</code> - Показать историю сделок\n"
         "❤️ <code>/donate</code> - Поддержать автора"
     )
 
@@ -230,16 +247,20 @@ async def handle_balance(message: Message):
     balance_info = await safetrade_client.get_balances_string()
     await message.answer(balance_info)
 
+# НОВЫЙ ОБРАБОТЧИК
+@router.message(Command("history"))
+async def handle_history(message: Message):
+    await message.answer("🔍 Запрашиваю историю сделок...")
+    history_info = await safetrade_client.get_trade_history(MARKET_SYMBOL)
+    await message.answer(history_info)
+
 @router.message(Command("sell_qtc"))
 async def handle_sell_qtc(message: Message):
     await message.answer(f"🔍 Инициирую продажу {CURRENCY_TO_SELL} по рынку...")
     balance = await safetrade_client.get_specific_balance(CURRENCY_TO_SELL)
-
     if balance is None or balance <= MIN_SELL_AMOUNT:
         await message.answer(f"ℹ️ Ваш баланс {CURRENCY_TO_SELL} ({balance or 0}) слишком мал для продажи.")
         return
-
-    # ИЗМЕНЕНО: Вызываем функцию для создания рыночного ордера
     result = await safetrade_client.create_market_sell_order(balance)
     await message.answer(result)
 
