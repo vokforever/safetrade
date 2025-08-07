@@ -257,42 +257,4 @@ async def handle_sell_qtc(message: Message):
     result = await safetrade_client.create_sell_order(balance, price)
     await message.answer(result)
 
-@router.message(Command("donate"))
-async def handle_donate(message: Message):
-    await message.answer("Спасибо за желание поддержать ❤️", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Поддержать автора", url="https://boosty.to/vokforever/donate")]]
-    ))
-
-# --- 6. Жизненный цикл бота ---
-async def on_startup(dispatcher: Dispatcher):
-    logger.info("🚀 Бот запускается...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    if SELL_INTERVAL_HOURS > 0:
-        scheduler.add_job(scheduled_sell_task, IntervalTrigger(hours=SELL_INTERVAL_HOURS), name='Auto-Sell Task')
-        scheduler.start()
-        logger.info(f"✅ Планировщик запущен: авто-продажа каждые {SELL_INTERVAL_HOURS} час(а).")
-    else:
-        logger.info("ℹ️ Автоматическая продажа по расписанию отключена.")
-
-    with suppress(Exception):
-        await bot.send_message(ADMIN_CHAT_ID, "✅ <b>Бот успешно запущен!</b>")
-
-async def on_shutdown(dispatcher: Dispatcher):
-    logger.info("🛑 Бот останавливается...")
-    if scheduler.running:
-        scheduler.shutdown()
-    await safetrade_client.close()
-    await bot.session.close()
-    logger.info("✅ Бот полностью остановлен")
-
-async def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await on_shutdown(dp)
-
-if __name__ == "__main__":
-    if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOK
+@router.message(Command(
