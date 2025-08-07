@@ -5,6 +5,7 @@ import json
 import os
 import telebot
 import threading
+import requests # Убедитесь, что этот импорт есть
 from telebot import types
 from dotenv import load_dotenv
 import cloudscraper
@@ -33,8 +34,31 @@ MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
 MIN_SELL_AMOUNT = 0.00000001
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
-# Улучшенная конфигурация скрейпера для обхода защиты Cloudflare
+
+# Продвинутая инициализация для обхода защиты Cloudflare
+# Создаем сессию вручную, чтобы передать более сложные параметры
+session = requests.Session()
+
+# Устанавливаем полный набор заголовков, типичный для современного браузера
+session.headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'TE': 'trailers'
+}
+
+# Создаем скрейпер на основе нашей кастомизированной сессии
 scraper = cloudscraper.create_scraper(
+    sess=session,
+    delay=10,  # Добавляем задержку для имитации человеческого поведения
     browser={
         'browser': 'chrome',
         'platform': 'windows',
@@ -51,7 +75,7 @@ menu_markup.row('/balance', '/sell_qtc')
 menu_markup.row('/history', '/donate')
 
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: для отправки длинных сообщений в Telegram ---
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: для отправки длинных сообщений ---
 def send_long_message(chat_id, text, **kwargs):
     """
     Разбивает длинное сообщение на части и отправляет их.
@@ -159,7 +183,7 @@ def get_current_bid_price(market_symbol):
         if isinstance(ticker_data, dict) and 'bid' in ticker_data:
             return float(ticker_data['bid'])
         else:
-            print(f"Неожиданный формат данных тикера для {market_symbol}: {ticker_data}")
+            print(f"Неожиданный формат данных тикера для {market_symbol} от SafeTrade: {ticker_data}")
             return None
     except Exception as e:
         print(f"Ошибка при получении текущей цены бида для {market_symbol}: {e}")
@@ -457,7 +481,7 @@ def handle_donate(message):
     )
 
 
-# --- Основной цикл бота ---
+# --- Основной цикл бота (с защитой от ошибок) ---
 if __name__ == "__main__":
     if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
         print("[CRITICAL] Не все переменные окружения установлены! Проверьте .env файл.")
@@ -466,7 +490,7 @@ if __name__ == "__main__":
             ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
             print("Бот SafeTrade запускается...")
             
-            # РЕШЕНИЕ ПРОБЛЕМЫ 409 Conflict: Удаляем старый вебхук.
+            # Гарантированно очищаем старые подключения перед стартом
             try:
                 print("Удаляю предыдущий вебхук для избежания конфликтов...")
                 bot.remove_webhook()
@@ -498,3 +522,8 @@ if __name__ == "__main__":
                     send_long_message(ADMIN_CHAT_ID, f"❌ *Критическая ошибка при запуске бота!*\n\n`{e}`", parse_mode='Markdown')
                 except Exception as notify_err:
                     print(f"Не удалось отправить уведомление об ошибке администратору: {notify_err}")
+        finally:
+            # Этот блок гарантирует корректное завершение работы
+            print("Завершение работы бота. Отключаю polling...")
+            bot.stop_polling()
+            print("Polling остановлен. Бот выключен.")
