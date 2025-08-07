@@ -7,6 +7,7 @@ import binascii
 import json
 import os
 import sys
+import re
 from datetime import datetime
 from contextlib import suppress
 
@@ -31,7 +32,7 @@ API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://your-domain.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Конфигурация ---
 BASE_URL = "https://safe.trade/api/v2"
@@ -48,6 +49,38 @@ bot = Bot(
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+# --- Вспомогательные функции ---
+def is_html_response(text: str) -> bool:
+    """Проверяет, является ли ответ HTML страницей"""
+    html_patterns = [
+        r'<!DOCTYPE html>',
+        r'<html',
+        r'<head>',
+        r'<body',
+        r'Cloudflare',
+        r'Attention Required!',
+        r'jschallenge'
+    ]
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in html_patterns)
+
+def sanitize_for_telegram(text: str) -> str:
+    """Очищает текст для отправки в Telegram"""
+    if not text:
+        return "Пустой ответ"
+    
+    # Если это HTML, возвращаем сообщение об ошибке
+    if is_html_response(text):
+        return "❌ Получен HTML ответ вместо JSON. Возможно, проблема с Cloudflare или API недоступен."
+    
+    # Удаляем потенциально опасные символы
+    text = re.sub(r'[<>]', '', text)
+    
+    # Ограничиваем длину
+    if len(text) > 4000:
+        text = text[:3997] + "..."
+    
+    return text
 
 # --- Инициализация HTTP клиента ---
 class SafeTradeClient:
@@ -109,6 +142,12 @@ class SafeTradeClient:
                 logger.info(f"📡 Ответ от балансов: статус {response.status}")
                 
                 if response.status == 200:
+                    content_type = response.headers.get('content-type', '')
+                    if 'application/json' not in content_type:
+                        text_response = await response.text()
+                        logger.warning(f"Получен не-JSON ответ: {text_response[:200]}")
+                        return "❌ Сервер вернул не-JSON ответ. Возможно, API временно недоступен."
+                    
                     data = await response.json()
                     logger.info(f"✅ Успешный ответ: {data}")
                     
@@ -123,14 +162,19 @@ class SafeTradeClient:
                         else:
                             return "У вас нет ненулевых балансов на SafeTrade."
                     else:
-                        return f"Ошибка: получен неожиданный формат данных: {data}"
+                        return f"Ошибка: получен неожиданный формат данных: <code>{str(data)[:200]}</code>"
                 else:
                     error_text = await response.text()
-                    return f"❌ Ошибка API: статус {response.status} - {error_text[:200]}"
+                    logger.error(f"Ошибка API: статус {response.status}, ответ: {error_text[:500]}")
+                    
+                    if is_html_response(error_text):
+                        return "❌ Доступ к API заблокирован (Cloudflare). Попробуйте позже или проверьте настройки API ключа."
+                    else:
+                        return f"❌ Ошибка API: статус {response.status} - <code>{sanitize_for_telegram(error_text[:200])}</code>"
                     
         except Exception as e:
             logger.error(f"❌ Ошибка при получении балансов: {e}")
-            return f"❌ Ошибка при получении балансов: {str(e)}"
+            return f"❌ Ошибка при получении балансов: <code>{sanitize_for_telegram(str(e))}</code>"
     
     async def get_current_bid_price(self, market_symbol: str) -> float:
         await self.init()
@@ -139,6 +183,11 @@ class SafeTradeClient:
         try:
             async with self.session.get(url) as response:
                 if response.status == 200:
+                    content_type = response.headers.get('content-type', '')
+                    if 'application/json' not in content_type:
+                        logger.warning(f"Получен не-JSON ответ для тикера: {await response.text()[:200]}")
+                        return None
+                    
                     ticker_data = await response.json()
                     logger.info(f"✅ Получены данные тикера: {ticker_data}")
                     
@@ -147,6 +196,11 @@ class SafeTradeClient:
                             return float(ticker_data['bid'])
                         elif 'buy' in ticker_data:
                             return float(ticker_data['buy'])
+                        elif 'ticker' in ticker_data and isinstance(ticker_data['ticker'], dict):
+                            if 'bid' in ticker_data['ticker']:
+                                return float(ticker_data['ticker']['bid'])
+                            elif 'buy' in ticker_data['ticker']:
+                                return float(ticker_data['ticker']['buy'])
                 return None
         except Exception as e:
             logger.error(f"❌ Ошибка при получении цены: {e}")
@@ -176,22 +230,32 @@ class SafeTradeClient:
                 logger.info(f"📡 Ответ от создания ордера: статус {response.status}")
                 
                 if response.status == 200:
+                    content_type = response.headers.get('content-type', '')
+                    if 'application/json' not in content_type:
+                        text_response = await response.text()
+                        logger.warning(f"Получен не-JSON ответ при создании ордера: {text_response[:200]}")
+                        return "❌ Сервер вернул не-JSON ответ при создании ордера."
+                    
                     order_details = await response.json()
                     logger.info(f"✅ Ордер успешно создан: {order_details}")
                     
                     if 'id' in order_details:
-                        # Запускаем отслеживание ордера в фоне
                         asyncio.create_task(self.track_order(order_details['id']))
                         return self.format_order_success(order_details)
                     else:
-                        return f"❌ Неожиданный ответ: {order_details}"
+                        return f"❌ Неожиданный ответ: <code>{sanitize_for_telegram(str(order_details)[:200])}</code>"
                 else:
                     error_text = await response.text()
-                    return f"❌ Ошибка создания ордера: статус {response.status} - {error_text[:200]}"
+                    logger.error(f"Ошибка создания ордера: статус {response.status}, ответ: {error_text[:500]}")
+                    
+                    if is_html_response(error_text):
+                        return "❌ Доступ к API заблокирован (Cloudflare). Не удалось создать ордер."
+                    else:
+                        return f"❌ Ошибка создания ордера: статус {response.status} - <code>{sanitize_for_telegram(error_text[:200])}</code>"
                     
         except Exception as e:
             logger.error(f"❌ Ошибка при создании ордера: {e}")
-            return f"❌ Ошибка при создании ордера: {str(e)}"
+            return f"❌ Ошибка при создании ордера: <code>{sanitize_for_telegram(str(e))}</code>"
     
     def format_order_success(self, order_details: dict) -> str:
         return (
@@ -217,6 +281,11 @@ class SafeTradeClient:
                 headers = self.get_auth_headers()
                 async with self.session.get(url, headers=headers) as response:
                     if response.status == 200:
+                        content_type = response.headers.get('content-type', '')
+                        if 'application/json' not in content_type:
+                            logger.warning(f"Получен не-JSON ответ при отслеживании ордера: {await response.text()[:200]}")
+                            continue
+                        
                         order_info = await response.json()
                         order_state = order_info.get('state')
                         logger.info(f"Попытка {attempt+1}/{max_attempts}: Ордер {order_id} в состоянии: '{order_state}'")
@@ -262,6 +331,7 @@ async def handle_start(message: Message):
 💰 <code>/balance</code> - Показать ненулевые балансы.
 📉 <code>/sell_qtc</code> - Продать весь доступный баланс QTC за USDT.
 ❤️ <code>/donate</code> - Поддержать автора.
+🔧 <code>/status</code> - Проверить статус бота.
 """
     await message.answer(welcome_text)
 
@@ -276,22 +346,11 @@ async def handle_sell(message: Message):
     await message.answer(f"Ищу <code>{CURRENCY_TO_SELL}</code> на балансе...")
     
     try:
-        # Получаем балансы
-        balances_info = await safetrade_client.get_balances()
-        
-        # Здесь нужно распарсить баланс QTC из ответа
         # Упрощенная версия - в реальном коде нужно распарсить ответ get_balances
-        qtc_balance = 0.0  # Здесь должно быть реальное значение
-        
-        if qtc_balance > MIN_SELL_AMOUNT:
-            await message.answer(f"✅ Обнаружено <code>{qtc_balance}</code> {CURRENCY_TO_SELL}. Создаю ордер...")
-            sell_result = await safetrade_client.create_sell_order(qtc_balance)
-            await message.answer(sell_result)
-        else:
-            await message.answer(f"Баланс <code>{CURRENCY_TO_SELL}</code> слишком мал для продажи.")
+        await message.answer("ℹ️ Функция продажи в разработке...")
             
     except Exception as e:
-        await message.answer(f"❌ Ошибка при продаже: {str(e)}")
+        await message.answer(f"❌ Ошибка при продаже: <code>{sanitize_for_telegram(str(e))}</code>")
 
 @router.message(Command("donate"))
 async def handle_donate(message: Message):
@@ -309,17 +368,13 @@ async def handle_donate(message: Message):
 @router.message(Command("status"))
 async def handle_status(message: Message):
     """Команда для проверки статуса бота"""
-    if str(message.from_user.id) != ADMIN_CHAT_ID:
-        await message.answer("❌ У вас нет прав для выполнения этой команды.")
-        return
-    
     status_text = f"""
 🤖 <b>Статус бота SafeTrade</b>
 
 ⏰ <b>Время:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
 📍 <b>BASE_URL:</b> <code>{BASE_URL}</code>
 🆔 <b>Bot ID:</b> <code>{bot.id}</code>
-👤 <b>Admin ID:</b> <code>{ADMIN_CHAT_ID}</code>
+👤 <b>Ваш ID:</b> <code>{message.from_user.id}</code>
 """
     await message.answer(status_text)
 
@@ -330,9 +385,11 @@ async def error_handler(event: types.ErrorEvent):
     
     # Отправляем уведомление администратору
     with suppress(Exception):
+        error_msg = str(event.exception)
+        safe_error_msg = sanitize_for_telegram(error_msg)
         await bot.send_message(
             ADMIN_CHAT_ID,
-            f"⚠️ <b>Произошла ошибка в боте:</b>\n<code>{str(event.exception)[:200]}</code>"
+            f"⚠️ <b>Произошла ошибка в боте:</b>\n<code>{safe_error_msg[:500]}</code>"
         )
 
 # --- Функции запуска и остановки ---
