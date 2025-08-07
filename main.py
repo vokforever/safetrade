@@ -1,3 +1,12 @@
+# Перед запуском убедитесь, что у вас есть файл requirements.txt с таким содержимым:
+#
+# aiogram==3.10.0
+# requests==2.32.3
+# cloudscraper==1.2.71
+# python-dotenv==1.0.1
+# apscheduler==3.10.4
+#
+
 import asyncio
 import logging
 import time
@@ -20,121 +29,164 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.client.bot import DefaultBotProperties
 from dotenv import load_dotenv
 
-# --- НОВОЕ: импорт для планировщика ---
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-# --- Настройка логирования ---
+# --- 1. Настройка ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Загрузка переменных окружения ---
 load_dotenv()
 API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-# --- НОВОЕ: переменная для авто-продажи ---
-# По умолчанию 1 час. Если установить 0, функция будет отключена.
+# Интервал авто-продажи в часах. 0 - отключено. По умолчанию 1 час.
 SELL_INTERVAL_HOURS = float(os.getenv("SELL_INTERVAL_HOURS", "1"))
 
-# --- Конфигурация ---
 BASE_URL = "https://safe.trade/api/v2"
 CURRENCY_TO_SELL = "QTC"
 CURRENCY_TO_BUY = "USDT"
 MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
-MIN_SELL_AMOUNT = 0.00000001
+MIN_SELL_AMOUNT = 0.00000001 # Минимальная сумма для создания ордера
 
-# --- Инициализация ---
+# --- 2. Инициализация ---
 bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
-scheduler = AsyncIOScheduler() # НОВОЕ: создаем экземпляр планировщика
+scheduler = AsyncIOScheduler()
 
-# --- Класс клиента (без изменений, остался таким же надежным) ---
+# --- 3. Класс для работы с API SafeTrade ---
 class SafeTradeClient:
     def __init__(self):
         self.scraper = None
-    
+        self.base_url = BASE_URL
+
     async def init(self):
-        if self.scraper is None:
-            session = requests.Session()
-            session.headers.update({
-                'Content-Type': 'application/json;charset=utf-8', 'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            })
-            self.scraper = cloudscraper.create_scraper(sess=session, browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}, interpreter=None, delay=10)
-            try:
-                logger.info("🔄 Получаю cookies с главной страницы...")
-                response = await asyncio.to_thread(self.scraper.get, "https://safe.trade", timeout=30)
-                response.raise_for_status()
-                logger.info(f"✅ Cookies получены, статус: {response.status_code}")
-                init_response = await asyncio.to_thread(self.scraper.get, f"{BASE_URL}/trade/public/tickers/{MARKET_SYMBOL}", timeout=30)
-                init_response.raise_for_status()
-                logger.info(f"✅ Инициализация API сессии, статус: {init_response.status_code}")
-            except Exception as e:
-                logger.error(f"⚠️ Критическая ошибка при инициализации клиента: {e}")
-                self.scraper = None
-    
+        """Инициализирует сессию cloudscraper и "прогревает" ее для обхода Cloudflare."""
+        if self.scraper is not None:
+            return  # Уже инициализирован
+
+        session = requests.Session()
+        session.headers.update({
+            'Content-Type': 'application/json;charset=utf-8',
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+        
+        self.scraper = cloudscraper.create_scraper(sess=session)
+        
+        try:
+            logger.info("🔄 Прогреваю сессию для обхода Cloudflare...")
+            response = await asyncio.to_thread(self.scraper.get, "https://safe.trade", timeout=30)
+            response.raise_for_status()
+            logger.info(f"✅ Cookies с главной страницы получены (статус: {response.status_code})")
+            
+            init_response = await asyncio.to_thread(self.scraper.get, f"{self.base_url}/trade/public/tickers/{MARKET_SYMBOL}", timeout=30)
+            init_response.raise_for_status()
+            logger.info(f"✅ Сессия API успешно инициализирована (статус: {init_response.status_code})")
+            
+        except Exception as e:
+            logger.error(f"⚠️ Критическая ошибка при инициализации клиента: {e}")
+            self.scraper = None  # Сбрасываем для повторной попытки в следующий раз
+
     async def close(self):
-        if self.scraper and hasattr(self.scraper, 'close'): self.scraper.close()
+        if self.scraper and hasattr(self.scraper, 'close'):
+            self.scraper.close()
         self.scraper = None
-    
+
     def get_auth_headers(self) -> dict:
+        """Генерирует заголовки для аутентификации, как в примере."""
         nonce = str(int(time.time() * 1000))
-        if not API_KEY or not API_SECRET: raise ValueError("API Key или API Secret не установлены.")
-        signature = hmac.new(API_SECRET.encode(), (nonce + API_KEY).encode(), hashlib.sha256).hexdigest()
-        return {"X-Auth-Apikey": API_KEY, "X-Auth-Nonce": nonce, "X-Auth-Signature": signature, "Content-Type": "application/json;charset=utf-8"}
+        if not API_KEY or not API_SECRET:
+            raise ValueError("API Key или API Secret не установлены.")
+        hash_obj = hmac.new(API_SECRET.encode(), digestmod=hashlib.sha256)
+        hash_obj.update((nonce + API_KEY).encode())
+        signature = binascii.hexlify(hash_obj.digest()).decode()
+        return {
+            "X-Auth-Apikey": API_KEY, "X-Auth-Nonce": nonce, "X-Auth-Signature": signature,
+            "Content-Type": "application/json;charset=utf-8"
+        }
 
     async def _get_raw_balances(self) -> list | None:
+        """Получает сырой список балансов, перебирая эндпоинты."""
         await self.init()
-        if not self.scraper: return None
-        endpoints = [f"{BASE_URL}/trade/account/balances", f"{BASE_URL}/peatio/account/balances", f"{BASE_URL}/account/balances"]
-        for endpoint in endpoints:
+        if not self.scraper:
+            logger.error("❌ Не удалось получить балансы: клиент не инициализирован.")
+            return None
+        
+        for endpoint in [f"{self.base_url}/trade/account/balances", f"{self.base_url}/peatio/account/balances"]:
             try:
                 response = await asyncio.to_thread(self.scraper.get, endpoint, headers=self.get_auth_headers(), timeout=30)
-                if response.status_code == 200 and isinstance(response.json(), list): return response.json()
-            except Exception as e: logger.error(f"❌ Исключение при запросе к {endpoint}: {e}")
+                if response.status_code == 200 and isinstance(data := response.json(), list):
+                    logger.info(f"✅ Балансы успешно получены через: {endpoint}")
+                    return data
+            except Exception as e:
+                logger.error(f"❌ Исключение при запросе к {endpoint}: {e}")
+        
+        logger.error("❌ Не удалось получить данные о балансах ни с одного эндпоинта.")
         return None
 
     async def get_balances_string(self) -> str:
+        """Возвращает отформатированную строку с ненулевыми балансами."""
         raw_balances = await self._get_raw_balances()
-        if raw_balances is None: return "❌ Не удалось получить балансы."
+        if raw_balances is None:
+            return "❌ Не удалось получить балансы. Проверьте логи."
+        
         non_zero_balances = [f"{b.get('currency', '').upper()}: <code>{b.get('balance', '0')}</code>" for b in raw_balances if float(b.get('balance', 0)) > 0]
         return "Ваши ненулевые балансы:\n\n" + "\n".join(non_zero_balances) if non_zero_balances else "У вас нет ненулевых балансов."
 
     async def get_specific_balance(self, currency: str) -> float | None:
+        """Возвращает баланс для конкретной валюты."""
         raw_balances = await self._get_raw_balances()
         if raw_balances:
             for item in raw_balances:
-                if item.get('currency', '').lower() == currency.lower(): return float(item.get('balance', 0.0))
+                if item.get('currency', '').lower() == currency.lower():
+                    return float(item.get('balance', 0.0))
         return None
 
     async def get_current_bid_price(self, market_symbol: str) -> float | None:
+        """Получает лучшую цену на покупку (bid) с гибким парсингом."""
         await self.init()
         if not self.scraper: return None
         try:
-            url = f"{BASE_URL}/trade/public/tickers/{market_symbol}"
+            url = f"{self.base_url}/trade/public/tickers/{market_symbol}"
             response = await asyncio.to_thread(self.scraper.get, url, timeout=30)
             if response.status_code == 200:
-                ticker_data = response.json().get('ticker', {})
-                return float(ticker_data.get('bid', 0.0))
-        except Exception as e: logger.error(f"❌ Ошибка при получении цены: {e}")
-        return None
-    
+                data = response.json()
+                logger.info(f"DEBUG: Ответ от API тикера ({market_symbol}): {json.dumps(data)}")
+
+                price = 0.0
+                if isinstance(data, dict):
+                    if 'ticker' in data and isinstance(data['ticker'], dict): price = float(data['ticker'].get('bid', 0.0))
+                    if price == 0.0 and 'bid' in data: price = float(data.get('bid', 0.0))
+                    if price == 0.0 and 'buy' in data: price = float(data.get('buy', 0.0))
+                
+                if price > 0:
+                    logger.info(f"✅ Цена для {market_symbol} успешно найдена: {price}")
+                    return price
+                logger.warning(f"⚠️ Не удалось найти валидную цену 'bid' в ответе: {data}")
+                return None
+            else:
+                logger.error(f"❌ Ошибка получения цены. Статус: {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Исключение при получении цены: {e}", exc_info=True)
+            return None
+
     async def create_sell_order(self, amount: float, price: float) -> str:
+        """Создает ордер на продажу."""
         await self.init()
         if not self.scraper: return "❌ Не удалось создать ордер: клиент не инициализирован."
+        
         data = {"market": MARKET_SYMBOL, "side": "sell", "amount": str(amount), "type": "limit", "price": str(price)}
         try:
-            response = await asyncio.to_thread(self.scraper.post, f"{BASE_URL}/trade/market/orders", headers=self.get_auth_headers(), json=data, timeout=30)
+            response = await asyncio.to_thread(self.scraper.post, f"{self.base_url}/trade/market/orders", headers=self.get_auth_headers(), json=data, timeout=30)
             if response.status_code in [200, 201]:
                 order_details = response.json()
-                if 'id' in order_details:
-                    asyncio.create_task(self.track_order(order_details['id']))
-                    return self.format_order_success(order_details)
+                if 'id' in order_details: return self.format_order_success(order_details)
                 return f"❌ Неожиданный ответ: <code>{str(order_details)[:200]}</code>"
             return f"❌ Ошибка создания ордера: статус {response.status_code}. Ответ: <code>{response.text[:200]}</code>"
         except Exception as e:
@@ -148,46 +200,40 @@ class SafeTradeClient:
                 f"<b>Цена:</b> <code>{order.get('price', 'N/A')} {CURRENCY_TO_BUY}</code>\n"
                 f"<b>ID:</b> <code>{order.get('id', 'N/A')}</code>")
 
-    async def track_order(self, order_id: str):
-        # ... (код отслеживания остается без изменений) ...
-        pass
-
-    async def send_safe_message(self, chat_id: str, text: str):
-        # ... (код безопасной отправки остается без изменений) ...
-        pass
-
 safetrade_client = SafeTradeClient()
 
-# --- НОВОЕ: Функция для автоматической продажи ---
+# --- 4. Задача для автоматической продажи ---
 async def scheduled_sell_task():
-    logger.info(f"--- Scheduled Task: Запуск автоматической продажи {CURRENCY_TO_SELL} ---")
+    logger.info(f"--- 🗓️ Запуск автоматической продажи {CURRENCY_TO_SELL} ---")
     try:
         balance = await safetrade_client.get_specific_balance(CURRENCY_TO_SELL)
-        if balance is None:
-            logger.error("Scheduled Task: Не удалось получить баланс, задача прервана.")
+        if balance is None or balance <= MIN_SELL_AMOUNT:
+            logger.info(f"🗓️ Задача завершена: баланс {CURRENCY_TO_SELL} ({balance or 0}) недостаточен для продажи.")
             return
 
-        if balance > MIN_SELL_AMOUNT:
-            logger.info(f"Scheduled Task: Баланс {balance} {CURRENCY_TO_SELL} достаточен для продажи.")
-            price = await safetrade_client.get_current_bid_price(MARKET_SYMBOL)
-            if not price:
-                logger.error("Scheduled Task: Не удалось получить цену, задача прервана.")
-                return
-            
-            result_message = await safetrade_client.create_sell_order(balance, price)
-            await safetrade_client.send_safe_message(ADMIN_CHAT_ID, "📈 <b>Автоматическая продажа:</b>\n\n" + result_message)
-        else:
-            logger.info(f"Scheduled Task: Баланс {balance} {CURRENCY_TO_SELL} слишком мал для продажи.")
+        logger.info(f"🗓️ Баланс {balance} {CURRENCY_TO_SELL} достаточен. Получаю цену...")
+        price = await safetrade_client.get_current_bid_price(MARKET_SYMBOL)
+        if not price:
+            logger.error("🗓️ Задача прервана: не удалось получить актуальную цену.")
+            return
+        
+        result_message = await safetrade_client.create_sell_order(balance, price)
+        await bot.send_message(ADMIN_CHAT_ID, "📈 <b>Автоматическая продажа:</b>\n\n" + result_message)
 
     except Exception as e:
-        logger.error(f"Scheduled Task: КРИТИЧЕСКАЯ ОШИБКА - {e}", exc_info=True)
-        await safetrade_client.send_safe_message(ADMIN_CHAT_ID, f"⚠️ <b>Ошибка в задаче авто-продажи:</b>\n<code>{str(e)}</code>")
+        logger.error(f"🗓️ КРИТИЧЕСКАЯ ОШИБКА в задаче авто-продажи: {e}", exc_info=True)
+        await bot.send_message(ADMIN_CHAT_ID, f"⚠️ <b>Ошибка в задаче авто-продажи:</b>\n<code>{str(e)}</code>")
 
-# --- Обработчики команд ---
+# --- 5. Обработчики команд Telegram ---
 @router.message(CommandStart())
 async def handle_start(message: Message):
-    # ... (код приветствия без изменений) ...
-    pass
+    await message.answer(
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "<b>Команды:</b>\n"
+        "💰 <code>/balance</code> - Показать балансы\n"
+        f"📉 <code>/sell_qtc</code> - Продать весь {CURRENCY_TO_SELL}\n"
+        "❤️ <code>/donate</code> - Поддержать автора"
+    )
 
 @router.message(Command("balance"))
 async def handle_balance(message: Message):
@@ -199,44 +245,45 @@ async def handle_balance(message: Message):
 async def handle_sell_qtc(message: Message):
     await message.answer(f"🔍 Инициирую продажу {CURRENCY_TO_SELL}...")
     balance = await safetrade_client.get_specific_balance(CURRENCY_TO_SELL)
+
     if balance is None:
-        await message.answer(f"❌ Не удалось получить баланс {CURRENCY_TO_SELL}.")
+        await message.answer(f"❌ Не удалось получить информацию о балансе {CURRENCY_TO_SELL}.")
         return
-    if balance > MIN_SELL_AMOUNT:
-        price = await safetrade_client.get_current_bid_price(MARKET_SYMBOL)
-        if not price:
-            await message.answer(f"❌ Не удалось получить цену для {MARKET_SYMBOL}.")
-            return
-        result = await safetrade_client.create_sell_order(balance, price)
-        await message.answer(result)
-    else:
+    if balance <= MIN_SELL_AMOUNT:
         await message.answer(f"ℹ️ Ваш баланс {CURRENCY_TO_SELL} ({balance}) слишком мал для продажи.")
+        return
 
-# ... (остальные обработчики: test_api, donate, status)
+    price = await safetrade_client.get_current_bid_price(MARKET_SYMBOL)
+    if not price:
+        await message.answer(f"❌ Не удалось получить актуальную цену для {MARKET_SYMBOL}.")
+        return
+        
+    result = await safetrade_client.create_sell_order(balance, price)
+    await message.answer(result)
 
-# --- Функции жизненного цикла ---
+@router.message(Command("donate"))
+async def handle_donate(message: Message):
+    await message.answer("Спасибо за желание поддержать ❤️", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Поддержать автора", url="https://boosty.to/vokforever/donate")]]
+    ))
+
+# --- 6. Жизненный цикл бота ---
 async def on_startup(dispatcher: Dispatcher):
     logger.info("🚀 Бот запускается...")
     await bot.delete_webhook(drop_pending_updates=True)
-    await safetrade_client.init() # Инициализируем клиент при старте
     
-    # --- НОВОЕ: Запуск планировщика ---
     if SELL_INTERVAL_HOURS > 0:
-        scheduler.add_job(
-            scheduled_sell_task,
-            trigger=IntervalTrigger(hours=SELL_INTERVAL_HOURS),
-            name='Automatic QTC selling job'
-        )
+        scheduler.add_job(scheduled_sell_task, IntervalTrigger(hours=SELL_INTERVAL_HOURS), name='Auto-Sell Task')
         scheduler.start()
         logger.info(f"✅ Планировщик запущен: авто-продажа каждые {SELL_INTERVAL_HOURS} час(а).")
     else:
-        logger.info("ℹ️ Автоматическая продажа по расписанию отключена (SELL_INTERVAL_HOURS=0).")
+        logger.info("ℹ️ Автоматическая продажа по расписанию отключена.")
 
     await bot.send_message(ADMIN_CHAT_ID, "✅ <b>Бот успешно запущен!</b>")
 
 async def on_shutdown(dispatcher: Dispatcher):
     logger.info("🛑 Бот останавливается...")
-    if scheduler.running: scheduler.shutdown() # НОВОЕ: останавливаем планировщик
+    if scheduler.running: scheduler.shutdown()
     await safetrade_client.close()
     await bot.session.close()
     logger.info("✅ Бот полностью остановлен")
@@ -250,6 +297,10 @@ async def main():
         await on_shutdown(dp)
 
 if __name__ == "__main__":
+    if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
+        logger.critical("❌ Критическая ошибка: Не все переменные окружения установлены. Проверьте .env файл.")
+        sys.exit(1)
+    
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
