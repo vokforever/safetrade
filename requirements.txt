@@ -3,3 +3,4 @@ aiohttp==3.9.5
 cloudscraper==1.2.71
 python-dotenv==1.0.1
 aiofiles==23.2.1
+apscheduler
