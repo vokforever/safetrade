@@ -5,6 +5,7 @@ import binascii
 import json
 import os
 import sys
+import signal
 import telebot
 import threading
 import requests
@@ -20,17 +21,14 @@ API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
-# ПРАВИЛЬНЫЙ БАЗОВЫЙ URL из официального примера
 BASE_URL = "https://safe.trade/api/v2"
-
 CURRENCY_TO_SELL = "QTC"
 CURRENCY_TO_BUY = "USDT"
-MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"  # qtcusdt
+MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
 MIN_SELL_AMOUNT = 0.00000001
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 def create_enhanced_scraper():
-    """Создает скрейпер"""
     session = requests.Session()
     session.headers.update({
         'Content-Type': 'application/json;charset=utf-8',
@@ -49,20 +47,16 @@ def create_enhanced_scraper():
 scraper = create_enhanced_scraper()
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
-# --- Функции API SafeTrade (соответствуют официальному примеру) ---
+# --- Функции API SafeTrade ---
 def generate_signature(nonce, secret, key):
-    """Генерирует подпись согласно официальному примеру"""
     hash_obj = hmac.new(secret.encode(), digestmod=hashlib.sha256)
-    # Конкатенируем nonce и key, затем вычисляем HMAC hash
     hash_obj.update((nonce + key).encode())
     signature = hash_obj.digest()
-    # Конвертируем бинарную подпись в шестнадцатеричное представление
     signature_hex = binascii.hexlify(signature).decode()
     return signature_hex
 
 def get_auth_headers():
-    """Собирает заголовки для аутентификации согласно официальному примеру"""
-    nonce = str(int(time.time() * 1000))  # Nonce в миллисекундах
+    nonce = str(int(time.time() * 1000))
     if not API_KEY or not API_SECRET:
         raise ValueError("API Key или API Secret не установлены.")
     
@@ -76,7 +70,6 @@ def get_auth_headers():
     }
 
 def get_balances_safetrade():
-    """Получает балансы согласно официальному примеру"""
     url = f"{BASE_URL}/trade/account/balances"
     
     try:
@@ -105,126 +98,21 @@ def get_balances_safetrade():
     except Exception as e:
         return f"❌ Ошибка при получении балансов: {e}"
 
-def get_current_bid_price(market_symbol):
-    """Получает текущую цену покупки"""
-    url = f"{BASE_URL}/trade/public/tickers/{market_symbol}"
+# --- РАДИКАЛЬНАЯ ОЧИСТКА ВСЕХ ЭКЗЕМПЛЯРОВ БОТА ---
+def force_cleanup_all_instances():
+    """Радикальная очистка всех возможных экземпляров бота"""
+    print("🔄 НАЧИНАЮ РАДИКАЛЬНУЮ ОЧИСТКУ ВСЕХ ЭКЗЕМПЛЯРОВ БОТА...")
     
-    try:
-        response = scraper.get(url, timeout=30)
-        
-        if response.status_code == 200:
-            ticker_data = response.json()
-            print(f"✅ Получены данные тикера: {ticker_data}")
-            
-            if isinstance(ticker_data, dict) and 'bid' in ticker_data:
-                return float(ticker_data['bid'])
-            elif isinstance(ticker_data, dict) and 'buy' in ticker_data:
-                return float(ticker_data['buy'])
-                
-        return None
-    except Exception as e:
-        print(f"❌ Ошибка при получении цены: {e}")
-        return None
-
-def create_sell_order_safetrade(amount):
-    """Создает ордер на продажу согласно официальному примеру"""
-    url = f"{BASE_URL}/trade/market/orders"
-    
-    current_bid_price = get_current_bid_price(MARKET_SYMBOL)
-    if current_bid_price is None or current_bid_price <= 0:
-        return f"❌ Не удалось получить актуальную цену для {MARKET_SYMBOL}"
-    
-    # Формируем данные согласно официальному примеру
-    data = {
-        "market": MARKET_SYMBOL,
-        "side": "sell",
-        "amount": str(amount),
-        "type": "limit"
-    }
-    data["price"] = str(current_bid_price)
-    
-    try:
-        headers = get_auth_headers()
-        print(f"🔄 Создаю ордер: {data}")
-        
-        response = scraper.post(url, headers=headers, json=data, timeout=30)
-        
-        print(f"📡 Ответ от создания ордера: статус {response.status_code}")
-        
-        if response.status_code == 200:
-            order_details = response.json()
-            print(f"✅ Ордер успешно создан: {order_details}")
-            
-            if 'id' in order_details:
-                threading.Thread(target=track_order, args=(order_details['id'],)).start()
-                return format_order_success(order_details)
-            else:
-                return f"❌ Неожиданный ответ: {order_details}"
-        else:
-            return f"❌ Ошибка создания ордера: статус {response.status_code} - {response.text}"
-                
-    except Exception as e:
-        return f"❌ Ошибка при создании ордера: {e}"
-
-def format_order_success(order_details):
-    """Форматирует успешный ответ о создании ордера"""
-    return (
-        f"✅ *Успешно размещен ордер на продажу!*\n\n"
-        f"*Биржа:* SafeTrade\n"
-        f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
-        f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
-        f"*Объем:* `{order_details.get('amount', 'N/A')} {CURRENCY_TO_SELL}`\n"
-        f"*Цена:* `{order_details.get('price', 'N/A')} {CURRENCY_TO_BUY}`\n"
-        f"*ID ордера:* `{order_details.get('id', 'N/A')}`"
-    )
-
-def track_order(order_id):
-    """Отслеживает статус ордера"""
-    max_attempts = 30
-    check_interval = 10
-    print(f"Начинаю отслеживание ордера {order_id}...")
-    
-    for attempt in range(max_attempts):
-        time.sleep(check_interval)
-        
-        url = f"{BASE_URL}/trade/market/orders/{order_id}"
+    # 1. Удаляем вебхук несколько раз с разными интервалами
+    for i in range(3):
         try:
-            headers = get_auth_headers()
-            response = scraper.get(url, headers=headers, timeout=30)
-            
-            if response.status_code == 200:
-                order_info = response.json()
-                order_state = order_info.get('state')
-                print(f"Попытка {attempt+1}/{max_attempts}: Ордер {order_id} в состоянии: '{order_state}'")
-                
-                if order_state == 'done':
-                    message = f"✅ *Ордер исполнен!*\n\n*ID ордера:* `{order_id}`"
-                    send_long_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-                    return
-                elif order_state == 'cancel':
-                    message = f"❌ *Ордер отменен!*\n\n*ID ордера:* `{order_id}`"
-                    send_long_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-                    return
-            else:
-                print(f"Ошибка получения статуса ордера: {response.status_code}")
-                
+            bot.remove_webhook()
+            print(f"✅ Вебхук удален (попытка {i+1})")
+            time.sleep(1)
         except Exception as e:
-            print(f"Ошибка при отслеживании ордера: {e}")
+            print(f"⚠️ Ошибка удаления вебхука (попытка {i+1}): {e}")
     
-    print(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток.")
-
-# --- Функция очистки экземпляров бота ---
-def cleanup_bot_instances():
-    """Агрессивная очистка всех экземпляров бота"""
-    print("🔄 Начинаю очистку экземпляров бота...")
-    
-    try:
-        bot.remove_webhook()
-        print("✅ Вебхук удален")
-        time.sleep(2)
-    except Exception as e:
-        print(f"⚠️ Ошибка удаления вебхука: {e}")
-    
+    # 2. Сбрасываем вебхук
     try:
         bot.set_webhook()
         print("✅ Вебхук сброшен")
@@ -232,18 +120,82 @@ def cleanup_bot_instances():
     except Exception as e:
         print(f"⚠️ Ошибка сброса вебхука: {e}")
     
+    # 3. Многократно очищаем все ожидающие обновления
+    for i in range(5):
+        try:
+            updates = bot.get_updates()
+            if updates:
+                last_update_id = updates[-1].update_id
+                bot.get_updates(offset=last_update_id + 1)
+                print(f"✅ Очищено {len(updates)} обновлений (попытка {i+1})")
+            else:
+                print(f"✅ Нет ожидающих обновлений (попытка {i+1})")
+            time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ Ошибка очистки обновлений (попытка {i+1}): {e}")
+    
+    # 4. Убиваем все процессы Python с похожими именами
     try:
+        import psutil
+        current_pid = os.getpid()
+        killed_count = 0
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # Пропускаем текущий процесс
+                if proc.info['pid'] == current_pid:
+                    continue
+                
+                # Ищем процессы Python
+                if 'python' in proc.info['name'].lower():
+                    cmdline = proc.info.get('cmdline', [])
+                    cmdline_str = ' '.join(str(cmd) for cmd in cmdline)
+                    
+                    # Убиваем процессы, связанные с нашим ботом
+                    if any(keyword in cmdline_str.lower() for keyword in ['safetrade', 'telegram', 'bot']):
+                        try:
+                            proc.kill()
+                            killed_count += 1
+                            print(f"🔪 Убит процесс PID {proc.info['pid']}: {cmdline_str[:100]}...")
+                        except:
+                            try:
+                                proc.terminate()
+                                killed_count += 1
+                                print(f"⚡ Завершен процесс PID {proc.info['pid']}: {cmdline_str[:100]}...")
+                            except:
+                                print(f"❌ Не удалось убить процесс PID {proc.info['pid']}")
+                        
+                        time.sleep(0.5)  # Небольшая задержка между убийствами процессов
+            
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        
+        if killed_count > 0:
+            print(f"🔪 Всего убито/завершено процессов: {killed_count}")
+            time.sleep(3)  # Даем время на завершение процессов
+        else:
+            print("✅ Дополнительные процессы не найдены")
+            
+    except ImportError:
+        print("⚠️ psutil не установлен, пропускаю убийство процессов")
+    
+    # 5. Дополнительная очистка через API Telegram
+    try:
+        # Получаем информацию о боте
+        bot_info = bot.get_me()
+        print(f"✅ Информация о боте получена: @{bot_info.username}")
+        
+        # Финальная очистка обновлений
         updates = bot.get_updates()
         if updates:
             last_update_id = updates[-1].update_id
             bot.get_updates(offset=last_update_id + 1)
-            print(f"✅ Очищено {len(updates)} ожидающих обновлений")
-        else:
-            print("✅ Нет ожидающих обновлений")
+            print(f"✅ Финальная очистка: удалено {len(updates)} обновлений")
+        
     except Exception as e:
-        print(f"⚠️ Ошибка очистки обновлений: {e}")
+        print(f"⚠️ Ошибка при финальной очистке: {e}")
     
-    print("✅ Очистка завершена")
+    print("✅ РАДИКАЛЬНАЯ ОЧИСТКА ЗАВЕРШЕНА")
 
 # --- Обработчики команд Telegram ---
 @bot.message_handler(commands=['start'])
@@ -254,7 +206,6 @@ def handle_start(message):
 ✅ `/start` - Показать это приветственное сообщение.
 💰 `/balance` - Показать ненулевые балансы.
 📉 `/sell_qtc` - Продать весь доступный баланс QTC за USDT.
-📊 `/history` - Показать историю последних исполненных ордеров.
 ❤️ `/donate` - Поддержать автора.
 """
     send_long_message(message.chat.id, text=welcome_text, parse_mode='Markdown')
@@ -265,48 +216,113 @@ def handle_balance(message):
     balance_info = get_balances_safetrade()
     send_long_message(message.chat.id, balance_info, parse_mode='Markdown')
 
+@bot.message_handler(commands=['cleanup'])
+def handle_cleanup(message):
+    """Команда для ручной очистки конфликтов"""
+    if str(message.chat.id) == str(ADMIN_CHAT_ID):
+        bot.send_message(message.chat.id, "🔄 Начинаю принудительную очистку...")
+        force_cleanup_all_instances()
+        bot.send_message(message.chat.id, "✅ Очистка завершена!")
+    else:
+        bot.send_message(message.chat.id, "❌ У вас нет прав для выполнения этой команды.")
+
+# --- Функция для отправки длинных сообщений ---
+def send_long_message(chat_id, text, **kwargs):
+    if not text:
+        return
+    MAX_MESSAGE_LENGTH = 4000
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        try:
+            bot.send_message(chat_id, text, **kwargs)
+        except Exception as e:
+            print(f"Ошибка при отправке сообщения: {e}")
+        return
+    
+    # Разбиваем длинное сообщение
+    parts = [text[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+    for part in parts:
+        try:
+            bot.send_message(chat_id, part, **kwargs)
+            time.sleep(0.1)  # Небольшая задержка между частями
+        except Exception as e:
+            print(f"Ошибка при отправке части сообщения: {e}")
+
+# --- Обработчик сигналов для корректного завершения ---
+def signal_handler(sig, frame):
+    print(f"\n🛑 Получен сигнал {sig}, завершаю работу...")
+    try:
+        bot.stop_polling()
+    except:
+        pass
+    sys.exit(0)
+
 # --- Основной цикл бота ---
 if __name__ == "__main__":
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
         print("[CRITICAL] Не все переменные окружения установлены! Проверьте .env файл.")
-    else:
+        sys.exit(1)
+    
+    try:
+        ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
+        print("🚀 Бот SafeTrade запускается...")
+        print(f"📍 Используемый BASE_URL: {BASE_URL}")
+        
+        # РАДИКАЛЬНАЯ ОЧИСТКА ПЕРЕД ЗАПУСКОМ
+        force_cleanup_all_instances()
+        
+        # Дополнительная пауза для гарантии очистки
+        time.sleep(2)
+        
+        start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         try:
-            ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
-            print("Бот SafeTrade запускается...")
-            print(f"Используемый BASE_URL: {BASE_URL}")
-            
-            # Агрессивная очистка
-            cleanup_bot_instances()
-            
-            start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            try:
-                send_long_message(
-                    ADMIN_CHAT_ID,
-                    f"✅ *Бот SafeTrade успешно запущен!*\n\n*Время:* `{start_time}`\n*BASE_URL:* `{BASE_URL}`\nОжидаю команды...",
-                    parse_mode='Markdown'
-                )
-                print(f"Уведомление о запуске отправлено администратору (ID: {ADMIN_CHAT_ID})")
-            except Exception as e:
-                print(f"Не удалось отправить уведомление: {e}")
-            
-            print("Бот начинает опрос Telegram API...")
-            
-            # Используем infinity_polling без лишних параметров
-            bot.infinity_polling(timeout=20, long_polling_timeout=30)
-            
-        except ValueError:
-            print("[CRITICAL] ADMIN_CHAT_ID в .env файле должен быть числом!")
+            send_long_message(
+                ADMIN_CHAT_ID,
+                f"✅ *Бот SafeTrade успешно запущен!*\n\n"
+                f"*Время:* `{start_time}`\n"
+                f"*BASE_URL:* `{BASE_URL}`\n"
+                f"*PID:* `{os.getpid()}`\n"
+                f"Ожидаю команды...",
+                parse_mode='Markdown'
+            )
+            print(f"✅ Уведомление о запуске отправлено администратору (ID: {ADMIN_CHAT_ID})")
         except Exception as e:
-            print(f"[ERROR] Критическая ошибка при запуске бота: {e}")
-            if ADMIN_CHAT_ID:
-                try:
-                    send_long_message(ADMIN_CHAT_ID, f"❌ *Критическая ошибка при запуске бота!*\n\n`{e}`", parse_mode='Markdown')
-                except Exception as notify_err:
-                    print(f"Не удалось отправить уведомление об ошибке администратору: {notify_err}")
-        finally:
-            print("Завершение работы бота. Отключаю polling...")
+            print(f"⚠️ Не удалось отправить уведомление: {e}")
+        
+        print("🔄 Бот начинает опрос Telegram API...")
+        
+        # Используем infinity_polling с обработкой ошибок
+        while True:
             try:
-                bot.stop_polling()
-            except:
-                pass
-            print("Polling остановлен. Бот выключен.")
+                bot.infinity_polling(timeout=20, long_polling_timeout=30)
+                break  # Если polling завершился нормально, выходим из цикла
+            except Exception as e:
+                print(f"❌ Ошибка в infinity_polling: {e}")
+                print("🔄 Пытаюсь перезапустить polling через 5 секунд...")
+                time.sleep(5)
+                
+                # Перед перезапуском снова очищаем
+                force_cleanup_all_instances()
+                print("🔄 Очистка завершена, перезапускаю polling...")
+        
+    except ValueError:
+        print("[CRITICAL] ADMIN_CHAT_ID в .env файле должен быть числом!")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] Критическая ошибка при запуске бота: {e}")
+        if ADMIN_CHAT_ID:
+            try:
+                send_long_message(ADMIN_CHAT_ID, f"❌ *Критическая ошибка при запуске бота!*\n\n`{e}`", parse_mode='Markdown')
+            except Exception as notify_err:
+                print(f"Не удалось отправить уведомление об ошибке администратору: {notify_err}")
+        sys.exit(1)
+    finally:
+        print("🛑 Завершение работы бота. Отключаю polling...")
+        try:
+            bot.stop_polling()
+        except:
+            pass
+        print("✅ Polling остановлен. Бот выключен.")
