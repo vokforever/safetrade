@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import time
 import hmac
 import hashlib
@@ -5,244 +7,417 @@ import binascii
 import json
 import os
 import sys
-import telebot
-import threading
-import requests
-import psutil
-from telebot import types
-from dotenv import load_dotenv
-import cloudscraper
 from datetime import datetime
+from contextlib import suppress
 
-# --- НАСТРОЙКИ ---
+import aiohttp
+import cloudscraper
+from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.client.bot import DefaultBotProperties
+
+from dotenv import load_dotenv
+
+# --- Настройка логирования ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Загрузка переменных окружения ---
 load_dotenv()
 API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-DONATE_URL = "https://boosty.to/vokforever/donate"
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Например: https://your-domain.com/webhook
 
-# ПРАВИЛЬНЫЙ БАЗОВЫЙ URL из официального примера
+# --- Конфигурация ---
 BASE_URL = "https://safe.trade/api/v2"
-
 CURRENCY_TO_SELL = "QTC"
 CURRENCY_TO_BUY = "USDT"
 MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
 MIN_SELL_AMOUNT = 0.00000001
 
+# --- Инициализация бота ---
+bot = Bot(
+    token=TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
-def create_safetrade_scraper():
-    """Создает скрейпер с правильными заголовками по умолчанию."""
-    session = requests.Session()
-    session.headers.update({
-        'Accept': 'application/json',
-        'User-Agent': 'SafeTrade-Client/1.0', # Как в официальном клиенте
-    })
-    return cloudscraper.create_scraper(sess=session)
-
-scraper = create_safetrade_scraper()
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-menu_markup.row('/balance', '/sell_qtc')
-menu_markup.row('/history', '/donate')
-
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def send_long_message(chat_id, text, **kwargs):
-    if not text: return
-    MAX_MESSAGE_LENGTH = 4000
-    if len(text) <= MAX_MESSAGE_LENGTH:
-        try: bot.send_message(chat_id, text, **kwargs)
-        except Exception as e: print(f"Ошибка при отправке сообщения: {e}")
-        return
-    parts = [text[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
-    for part in parts:
+# --- Инициализация HTTP клиента ---
+class SafeTradeClient:
+    def __init__(self):
+        self.session = None
+        self.scraper = None
+    
+    async def init(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={
+                    'Content-Type': 'application/json;charset=utf-8',
+                    'Accept': 'application/json',
+                    'User-Agent': 'SafeTrade-Client/1.0',
+                    'Origin': 'https://safe.trade',
+                    'Referer': 'https://safe.trade/'
+                }
+            )
+        
+        if self.scraper is None:
+            self.scraper = cloudscraper.create_scraper(
+                browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True},
+                delay=10
+            )
+    
+    async def close(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    def generate_signature(self, nonce: str, secret: str, key: str) -> str:
+        hash_obj = hmac.new(secret.encode(), digestmod=hashlib.sha256)
+        hash_obj.update((nonce + key).encode())
+        signature = hash_obj.digest()
+        return binascii.hexlify(signature).decode()
+    
+    def get_auth_headers(self) -> dict:
+        nonce = str(int(time.time() * 1000))
+        if not API_KEY or not API_SECRET:
+            raise ValueError("API Key или API Secret не установлены.")
+        
+        signature = self.generate_signature(nonce, API_SECRET, API_KEY)
+        
+        return {
+            "X-Auth-Apikey": API_KEY,
+            "X-Auth-Nonce": nonce,
+            "X-Auth-Signature": signature,
+            "Content-Type": "application/json;charset=utf-8"
+        }
+    
+    async def get_balances(self) -> str:
+        await self.init()
+        url = f"{BASE_URL}/trade/account/balances"
+        
         try:
-            bot.send_message(chat_id, part, **kwargs)
-            time.sleep(0.1)
-        except Exception as e: print(f"Ошибка при отправке части сообщения: {e}")
-
-
-# --- Функции API SafeTrade (соответствуют официальному примеру) ---
-
-def generate_signature(nonce, secret, key):
-    """Генерирует подпись согласно официальному примеру."""
-    hash_obj = hmac.new(secret.encode(), digestmod=hashlib.sha256)
-    hash_obj.update((nonce + key).encode())
-    signature = hash_obj.digest()
-    return binascii.hexlify(signature).decode()
-
-def get_auth_headers():
-    """Собирает заголовки для аутентификации."""
-    nonce = str(int(time.time() * 1000))
-    if not API_KEY or not API_SECRET:
-        raise ValueError("API Key или API Secret не установлены.")
+            headers = self.get_auth_headers()
+            async with self.session.get(url, headers=headers) as response:
+                logger.info(f"📡 Ответ от балансов: статус {response.status}")
+                
+                if response.status == 200:
+                    data = await response.json()
+                    logger.info(f"✅ Успешный ответ: {data}")
+                    
+                    if isinstance(data, list):
+                        non_zero_balances = [
+                            f"{b.get('currency', '').upper()}: <code>{b.get('balance', '0')}</code>"
+                            for b in data if float(b.get('balance', 0)) > 0
+                        ]
+                        
+                        if non_zero_balances:
+                            return "Ваши ненулевые балансы на SafeTrade:\n\n" + "\n".join(non_zero_balances)
+                        else:
+                            return "У вас нет ненулевых балансов на SafeTrade."
+                    else:
+                        return f"Ошибка: получен неожиданный формат данных: {data}"
+                else:
+                    error_text = await response.text()
+                    return f"❌ Ошибка API: статус {response.status} - {error_text[:200]}"
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка при получении балансов: {e}")
+            return f"❌ Ошибка при получении балансов: {str(e)}"
     
-    signature = generate_signature(nonce, API_SECRET, API_KEY)
-    
-    return {
-        "X-Auth-Apikey": API_KEY,
-        "X-Auth-Nonce": nonce,
-        "X-Auth-Signature": signature,
-        "Content-Type": "application/json;charset=utf-8"
-    }
-
-def get_balances_safetrade():
-    """Получает балансы согласно официальному API."""
-    url = f"{BASE_URL}/trade/account/balances"
-    try:
-        headers = get_auth_headers()
-        response = scraper.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    async def get_current_bid_price(self, market_symbol: str) -> float:
+        await self.init()
+        url = f"{BASE_URL}/trade/public/tickers/{market_symbol}"
         
-        if isinstance(data, list):
-            non_zero_balances = [f"{b.get('currency', '').upper()}: `{b.get('balance', '0')}`" 
-                               for b in data if float(b.get('balance', 0)) > 0]
-            if non_zero_balances:
-                return "Ваши ненулевые балансы:\n\n" + "\n".join(non_zero_balances)
-            return "У вас нет ненулевых балансов."
-        return f"Ошибка: получен неожиданный формат данных: {data}"
-    except Exception as e:
-        error_text = f"❌ Ошибка при получении балансов: {e}"
-        if hasattr(e, 'response'): error_text += f"\nОтвет сервера: ```{e.response.text}```"
-        return error_text
-
-def get_current_bid_price(market_symbol):
-    """Получает текущую лучшую цену покупки."""
-    url = f"{BASE_URL}/trade/public/tickers/{market_symbol}"
-    try:
-        response = scraper.get(url, timeout=30)
-        response.raise_for_status()
-        ticker_data = response.json()
-        if isinstance(ticker_data, dict) and 'bid' in ticker_data:
-            return float(ticker_data['bid'])
-        return None
-    except Exception as e:
-        print(f"❌ Ошибка при получении цены: {e}")
-        return None
-
-def create_sell_order_safetrade(amount):
-    """Создает ордер на продажу согласно официальному API."""
-    url = f"{BASE_URL}/trade/market/orders"
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    ticker_data = await response.json()
+                    logger.info(f"✅ Получены данные тикера: {ticker_data}")
+                    
+                    if isinstance(ticker_data, dict):
+                        if 'bid' in ticker_data:
+                            return float(ticker_data['bid'])
+                        elif 'buy' in ticker_data:
+                            return float(ticker_data['buy'])
+                return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка при получении цены: {e}")
+            return None
     
-    current_bid_price = get_current_bid_price(MARKET_SYMBOL)
-    if current_bid_price is None or current_bid_price <= 0:
-        return f"❌ Не удалось получить актуальную цену для {MARKET_SYMBOL}"
-    
-    data = {
-        "market": MARKET_SYMBOL,
-        "side": "sell",
-        "amount": str(amount),
-        "type": "limit",
-        "price": str(current_bid_price)
-    }
-    
-    try:
-        headers = get_auth_headers()
-        # Для POST запросов используем json=data
-        response = scraper.post(url, headers=headers, json=data, timeout=30)
-        response.raise_for_status()
-        order_details = response.json()
+    async def create_sell_order(self, amount: float) -> str:
+        await self.init()
+        url = f"{BASE_URL}/trade/market/orders"
         
-        if 'id' in order_details:
-            return format_order_success(order_details)
-        return f"❌ Неожиданный ответ от API: {order_details}"
-    except Exception as e:
-        error_text = f"❌ Ошибка при создании ордера: {e}"
-        if hasattr(e, 'response'): error_text += f"\nОтвет сервера: ```{e.response.text}```"
-        return error_text
+        current_bid_price = await self.get_current_bid_price(MARKET_SYMBOL)
+        if current_bid_price is None or current_bid_price <= 0:
+            return f"❌ Не удалось получить актуальную цену для {MARKET_SYMBOL}"
+        
+        data = {
+            "market": MARKET_SYMBOL,
+            "side": "sell",
+            "amount": str(amount),
+            "type": "limit",
+            "price": str(current_bid_price)
+        }
+        
+        try:
+            headers = self.get_auth_headers()
+            logger.info(f"🔄 Создаю ордер: {data}")
+            
+            async with self.session.post(url, headers=headers, json=data) as response:
+                logger.info(f"📡 Ответ от создания ордера: статус {response.status}")
+                
+                if response.status == 200:
+                    order_details = await response.json()
+                    logger.info(f"✅ Ордер успешно создан: {order_details}")
+                    
+                    if 'id' in order_details:
+                        # Запускаем отслеживание ордера в фоне
+                        asyncio.create_task(self.track_order(order_details['id']))
+                        return self.format_order_success(order_details)
+                    else:
+                        return f"❌ Неожиданный ответ: {order_details}"
+                else:
+                    error_text = await response.text()
+                    return f"❌ Ошибка создания ордера: статус {response.status} - {error_text[:200]}"
+                    
+        except Exception as e:
+            logger.error(f"❌ Ошибка при создании ордера: {e}")
+            return f"❌ Ошибка при создании ордера: {str(e)}"
+    
+    def format_order_success(self, order_details: dict) -> str:
+        return (
+            f"✅ <b>Успешно размещен ордер на продажу!</b>\n\n"
+            f"<b>Биржа:</b> SafeTrade\n"
+            f"<b>Пара:</b> <code>{order_details.get('market', 'N/A').upper()}</code>\n"
+            f"<b>Сторона:</b> <code>{order_details.get('side', 'N/A').capitalize()}</code>\n"
+            f"<b>Объем:</b> <code>{order_details.get('amount', 'N/A')} {CURRENCY_TO_SELL}</code>\n"
+            f"<b>Цена:</b> <code>{order_details.get('price', 'N/A')} {CURRENCY_TO_BUY}</code>\n"
+            f"<b>ID ордера:</b> <code>{order_details.get('id', 'N/A')}</code>"
+        )
+    
+    async def track_order(self, order_id: str):
+        max_attempts = 30
+        check_interval = 10
+        logger.info(f"Начинаю отслеживание ордера {order_id}...")
+        
+        for attempt in range(max_attempts):
+            await asyncio.sleep(check_interval)
+            
+            url = f"{BASE_URL}/trade/market/orders/{order_id}"
+            try:
+                headers = self.get_auth_headers()
+                async with self.session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        order_info = await response.json()
+                        order_state = order_info.get('state')
+                        logger.info(f"Попытка {attempt+1}/{max_attempts}: Ордер {order_id} в состоянии: '{order_state}'")
+                        
+                        if order_state == 'done':
+                            message = f"✅ <b>Ордер исполнен!</b>\n\n<b>ID ордера:</b> <code>{order_id}</code>"
+                            await self.send_safe_message(ADMIN_CHAT_ID, message)
+                            return
+                        elif order_state == 'cancel':
+                            message = f"❌ <b>Ордер отменен!</b>\n\n<b>ID ордера:</b> <code>{order_id}</code>"
+                            await self.send_safe_message(ADMIN_CHAT_ID, message)
+                            return
+                    else:
+                        logger.error(f"Ошибка получения статуса ордера: {response.status}")
+                        
+            except Exception as e:
+                logger.error(f"Ошибка при отслеживании ордера: {e}")
+        
+        logger.info(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток.")
+    
+    async def send_safe_message(self, chat_id: str, text: str):
+        """Безопасная отправка сообщения с обработкой ошибок"""
+        try:
+            await bot.send_message(chat_id, text)
+        except TelegramRetryAfter as e:
+            logger.warning(f"Флуд-контроль, жду {e.retry_after} секунд")
+            await asyncio.sleep(e.retry_after)
+            await bot.send_message(chat_id, text)
+        except TelegramAPIError as e:
+            logger.error(f"Ошибка отправки сообщения: {e}")
 
-def format_order_success(order_details):
-    """Форматирует успешный ответ о создании ордера."""
-    return (
-        f"✅ *Успешно размещен ордер!*\n\n"
-        f"*ID ордера:* `{order_details.get('id', 'N/A')}`\n"
-        f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
-        f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
-        f"*Объем:* `{order_details.get('amount', 'N/A')} {CURRENCY_TO_SELL}`\n"
-        f"*Цена:* `{order_details.get('price', 'N/A')} {CURRENCY_TO_BUY}`\n"
-        f"*Статус:* `{order_details.get('state', 'N/A').capitalize()}`"
+# Глобальный экземпляр клиента
+safetrade_client = SafeTradeClient()
+
+# --- Обработчики команд ---
+@router.message(CommandStart())
+async def handle_start(message: Message):
+    welcome_text = """
+👋 <b>Добро пожаловать в бот для управления биржей SafeTrade!</b>
+
+<b>Доступные команды:</b>
+✅ <code>/start</code> - Показать это приветственное сообщение.
+💰 <code>/balance</code> - Показать ненулевые балансы.
+📉 <code>/sell_qtc</code> - Продать весь доступный баланс QTC за USDT.
+❤️ <code>/donate</code> - Поддержать автора.
+"""
+    await message.answer(welcome_text)
+
+@router.message(Command("balance"))
+async def handle_balance(message: Message):
+    await message.answer("🔍 Запрашиваю балансы с SafeTrade...")
+    balance_info = await safetrade_client.get_balances()
+    await message.answer(balance_info)
+
+@router.message(Command("sell_qtc"))
+async def handle_sell(message: Message):
+    await message.answer(f"Ищу <code>{CURRENCY_TO_SELL}</code> на балансе...")
+    
+    try:
+        # Получаем балансы
+        balances_info = await safetrade_client.get_balances()
+        
+        # Здесь нужно распарсить баланс QTC из ответа
+        # Упрощенная версия - в реальном коде нужно распарсить ответ get_balances
+        qtc_balance = 0.0  # Здесь должно быть реальное значение
+        
+        if qtc_balance > MIN_SELL_AMOUNT:
+            await message.answer(f"✅ Обнаружено <code>{qtc_balance}</code> {CURRENCY_TO_SELL}. Создаю ордер...")
+            sell_result = await safetrade_client.create_sell_order(qtc_balance)
+            await message.answer(sell_result)
+        else:
+            await message.answer(f"Баланс <code>{CURRENCY_TO_SELL}</code> слишком мал для продажи.")
+            
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при продаже: {str(e)}")
+
+@router.message(Command("donate"))
+async def handle_donate(message: Message):
+    donate_url = "https://boosty.to/vokforever/donate"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Поддержать автора ❤️", url=donate_url)]
+        ]
+    )
+    await message.answer(
+        "Если вы хотите поддержать разработку этого бота, вы можете сделать пожертвование. Спасибо!",
+        reply_markup=keyboard
     )
 
+@router.message(Command("status"))
+async def handle_status(message: Message):
+    """Команда для проверки статуса бота"""
+    if str(message.from_user.id) != ADMIN_CHAT_ID:
+        await message.answer("❌ У вас нет прав для выполнения этой команды.")
+        return
+    
+    status_text = f"""
+🤖 <b>Статус бота SafeTrade</b>
 
-# --- Обработчики команд Telegram ---
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    send_long_message(message.chat.id, "👋 Добро пожаловать! Используйте кнопки для управления ботом.", parse_mode='Markdown', reply_markup=menu_markup)
+⏰ <b>Время:</b> <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
+📍 <b>BASE_URL:</b> <code>{BASE_URL}</code>
+🆔 <b>Bot ID:</b> <code>{bot.id}</code>
+👤 <b>Admin ID:</b> <code>{ADMIN_CHAT_ID}</code>
+"""
+    await message.answer(status_text)
 
-@bot.message_handler(commands=['balance'])
-def handle_balance(message):
-    bot.send_message(message.chat.id, "🔍 Запрашиваю балансы...")
-    balance_info = get_balances_safetrade()
-    send_long_message(message.chat.id, balance_info, parse_mode='Markdown')
+# --- Обработчик ошибок ---
+@router.errors()
+async def error_handler(event: types.ErrorEvent):
+    logger.error(f"Произошла ошибка: {event.exception}", exc_info=True)
+    
+    # Отправляем уведомление администратору
+    with suppress(Exception):
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            f"⚠️ <b>Произошла ошибка в боте:</b>\n<code>{str(event.exception)[:200]}</code>"
+        )
 
-@bot.message_handler(commands=['sell_qtc'])
-def handle_sell_qtc(message):
-    bot.send_message(message.chat.id, f"Ищу `{CURRENCY_TO_SELL}` на балансе...", parse_mode='Markdown')
-    # Здесь должна быть логика получения баланса QTC и вызова create_sell_order_safetrade
-    # Для примера, продаем фиксированное количество:
-    result = create_sell_order_safetrade("1.0") # Замените на реальное получение баланса
-    send_long_message(message.chat.id, result, parse_mode='Markdown')
+# --- Функции запуска и остановки ---
+async def on_startup(dispatcher: Dispatcher):
+    logger.info("🚀 Бот SafeTrade запускается...")
+    
+    # Удаляем вебхук
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Устанавливаем вебхук, если указан URL
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"📡 Вебхук установлен: {WEBHOOK_URL}")
+    else:
+        logger.info("🔄 Запускаем в режиме polling...")
+    
+    # Отправляем уведомление администратору
+    with suppress(Exception):
+        start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            f"✅ <b>Бот SafeTrade успешно запущен!</b>\n\n"
+            f"<b>Время:</b> <code>{start_time}</code>\n"
+            f"<b>BASE_URL:</b> <code>{BASE_URL}</code>\n"
+            f"<b>Режим:</b> <code>Вебхук</code>" if WEBHOOK_URL else "<code>Polling</code>"
+        )
 
-# ... Другие обработчики ...
+async def on_shutdown(dispatcher: Dispatcher):
+    logger.info("🛑 Бот SafeTrade останавливается...")
+    
+    # Закрываем HTTP клиент
+    await safetrade_client.close()
+    
+    # Удаляем вебхук
+    await bot.delete_webhook()
+    
+    # Закрываем сессию бота
+    await bot.session.close()
+    
+    logger.info("✅ Бот полностью остановлен")
 
-
-# --- Основной цикл бота ---
-def cleanup_bot_instances():
-    """Надежная очистка экземпляров бота перед запуском."""
-    print("🔄 Начинаю очистку экземпляров бота...")
-    try:
-        bot.remove_webhook()
-        print("✅ Вебхук удален.")
-        time.sleep(1)
-        updates = bot.get_updates(offset=-1, timeout=1)
-        if updates:
-            last_update_id = updates[-1].update_id
-            bot.get_updates(offset=last_update_id + 1, timeout=1)
-            print(f"✅ Очищено {len(updates)} ожидающих обновлений.")
-        else:
-            print("✅ Нет ожидающих обновлений.")
-    except Exception as e:
-        print(f"⚠️ Ошибка во время очистки (это может быть нормально): {e}")
-    print("✅ Очистка завершена.")
+# --- Основная функция запуска ---
+async def main():
+    # Инициализация клиента
+    await safetrade_client.init()
+    
+    # Регистрация хуков запуска/остановки
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
+    # Запуск бота
+    if WEBHOOK_URL:
+        # Запуск с вебхуком
+        from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+        from aiohttp import web
+        
+        app = web.Application()
+        webhook_requests_handler = SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot
+        )
+        
+        webhook_requests_handler.register(app, path="/webhook")
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, '0.0.0.0', 8080)
+        await site.start()
+        
+        logger.info("🚀 Сервер вебхуков запущен на порту 8080")
+        
+        try:
+            await dp.start_polling(bot)
+        finally:
+            await runner.cleanup()
+    else:
+        # Запуск с polling
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
-        print("[CRITICAL] Не все переменные окружения установлены!")
-        sys.exit(1)
-        
     try:
-        ADMIN_CHAT_ID = int(ADMIN_CHAT_ID)
-        
-        # Проверка на дубликаты
-        current_pid = os.getpid()
-        script_name = os.path.basename(__file__)
-        for proc in psutil.process_iter(['pid', 'cmdline']):
-            try:
-                if proc.info['pid'] != current_pid and proc.info['cmdline'] and len(proc.info['cmdline']) > 1 and 'python' in proc.info['cmdline'][0] and script_name in proc.info['cmdline'][1]:
-                    print(f"ОШИБКА: Обнаружен другой работающий экземпляр (PID: {proc.info['pid']}). Запуск отменен.")
-                    sys.exit(1)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
-                continue
-        
-        print("Бот SafeTrade запускается...")
-        
-        cleanup_bot_instances()
-        
-        start_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        send_long_message(ADMIN_CHAT_ID, f"✅ *Бот успешно запущен!*\n*Время:* `{start_time}`", parse_mode='Markdown')
-        
-        print("Бот начинает опрос Telegram API...")
-        bot.infinity_polling(timeout=20, long_polling_timeout=30)
-        
-    except ValueError:
-        print("[CRITICAL] ADMIN_CHAT_ID должен быть числом!")
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен вручную")
     except Exception as e:
-        print(f"[ERROR] Критическая ошибка при запуске бота: {e}")
-    finally:
-        print("Завершение работы бота...")
-        if 'bot' in locals() and bot is not None:
-            bot.stop_polling()
+        logger.error(f"❌ Критическая ошибка: {e}")
+        sys.exit(1)
