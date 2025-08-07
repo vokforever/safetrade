@@ -65,9 +65,8 @@ class SafeTradeClient:
         self.base_url = BASE_URL
 
     async def init(self):
-        """Инициализирует сессию cloudscraper и "прогревает" ее для обхода Cloudflare."""
         if self.scraper is not None:
-            return  # Уже инициализирован
+            return
 
         session = requests.Session()
         session.headers.update({
@@ -90,7 +89,7 @@ class SafeTradeClient:
             
         except Exception as e:
             logger.error(f"⚠️ Критическая ошибка при инициализации клиента: {e}")
-            self.scraper = None  # Сбрасываем для повторной попытки в следующий раз
+            self.scraper = None
 
     async def close(self):
         if self.scraper and hasattr(self.scraper, 'close'):
@@ -98,7 +97,6 @@ class SafeTradeClient:
         self.scraper = None
 
     def get_auth_headers(self) -> dict:
-        """Генерирует заголовки для аутентификации, как в примере."""
         nonce = str(int(time.time() * 1000))
         if not API_KEY or not API_SECRET:
             raise ValueError("API Key или API Secret не установлены.")
@@ -111,7 +109,6 @@ class SafeTradeClient:
         }
 
     async def _get_raw_balances(self) -> list | None:
-        """Получает сырой список балансов, перебирая эндпоинты."""
         await self.init()
         if not self.scraper:
             logger.error("❌ Не удалось получить балансы: клиент не инициализирован.")
@@ -130,7 +127,6 @@ class SafeTradeClient:
         return None
 
     async def get_balances_string(self) -> str:
-        """Возвращает отформатированную строку с ненулевыми балансами."""
         raw_balances = await self._get_raw_balances()
         if raw_balances is None:
             return "❌ Не удалось получить балансы. Проверьте логи."
@@ -139,7 +135,6 @@ class SafeTradeClient:
         return "Ваши ненулевые балансы:\n\n" + "\n".join(non_zero_balances) if non_zero_balances else "У вас нет ненулевых балансов."
 
     async def get_specific_balance(self, currency: str) -> float | None:
-        """Возвращает баланс для конкретной валюты."""
         raw_balances = await self._get_raw_balances()
         if raw_balances:
             for item in raw_balances:
@@ -148,7 +143,6 @@ class SafeTradeClient:
         return None
 
     async def get_current_price(self, market_symbol: str) -> float | None:
-        """Получает последнюю цену сделки (last) из тикера."""
         await self.init()
         if not self.scraper: return None
         try:
@@ -160,10 +154,8 @@ class SafeTradeClient:
 
                 price = 0.0
                 if isinstance(data, dict):
-                    # ИСПОЛЬЗУЕМ 'last' ВМЕСТО 'bid', ТАК КАК API НЕ ОТДАЕТ BID/ASK
                     if 'last' in data:
                         price = float(data.get('last', 0.0))
-                    # Резервная проверка, если структура вдруг изменится
                     elif 'ticker' in data and isinstance(data['ticker'], dict):
                         price = float(data['ticker'].get('last', 0.0))
                 
@@ -181,7 +173,6 @@ class SafeTradeClient:
             return None
 
     async def create_sell_order(self, amount: float, price: float) -> str:
-        """Создает ордер на продажу."""
         await self.init()
         if not self.scraper: return "❌ Не удалось создать ордер: клиент не инициализирован."
         
@@ -249,4 +240,59 @@ async def handle_balance(message: Message):
 @router.message(Command("sell_qtc"))
 async def handle_sell_qtc(message: Message):
     await message.answer(f"🔍 Инициирую продажу {CURRENCY_TO_SELL}...")
-    balance = await safetrade_client.get_specific_balance(C
+    balance = await safetrade_client.get_specific_balance(CURRENCY_TO_SELL)
+
+    if balance is None:
+        await message.answer(f"❌ Не удалось получить информацию о балансе {CURRENCY_TO_SELL}.")
+        return
+    if balance <= MIN_SELL_AMOUNT:
+        await message.answer(f"ℹ️ Ваш баланс {CURRENCY_TO_SELL} ({balance}) слишком мал для продажи.")
+        return
+
+    price = await safetrade_client.get_current_price(MARKET_SYMBOL)
+    if not price:
+        await message.answer(f"❌ Не удалось получить актуальную цену для {MARKET_SYMBOL}.")
+        return
+        
+    result = await safetrade_client.create_sell_order(balance, price)
+    await message.answer(result)
+
+@router.message(Command("donate"))
+async def handle_donate(message: Message):
+    await message.answer("Спасибо за желание поддержать ❤️", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Поддержать автора", url="https://boosty.to/vokforever/donate")]]
+    ))
+
+# --- 6. Жизненный цикл бота ---
+async def on_startup(dispatcher: Dispatcher):
+    logger.info("🚀 Бот запускается...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    if SELL_INTERVAL_HOURS > 0:
+        scheduler.add_job(scheduled_sell_task, IntervalTrigger(hours=SELL_INTERVAL_HOURS), name='Auto-Sell Task')
+        scheduler.start()
+        logger.info(f"✅ Планировщик запущен: авто-продажа каждые {SELL_INTERVAL_HOURS} час(а).")
+    else:
+        logger.info("ℹ️ Автоматическая продажа по расписанию отключена.")
+
+    with suppress(Exception):
+        await bot.send_message(ADMIN_CHAT_ID, "✅ <b>Бот успешно запущен!</b>")
+
+async def on_shutdown(dispatcher: Dispatcher):
+    logger.info("🛑 Бот останавливается...")
+    if scheduler.running:
+        scheduler.shutdown()
+    await safetrade_client.close()
+    await bot.session.close()
+    logger.info("✅ Бот полностью остановлен")
+
+async def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await on_shutdown(dp)
+
+if __name__ == "__main__":
+    if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOK
