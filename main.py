@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import cloudscraper
 from datetime import datetime
 import threading
+from supabase import create_client, Client
 
 # --- НАСТРОЙКИ ---
 load_dotenv()
@@ -17,27 +18,129 @@ API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # ID администратора для уведомлений
-
+# Supabase настройки
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # URL для пожертвований
 DONATE_URL = "https://boosty.to/vokforever/donate"
-
 # Убедимся, что секрет в байтовом представлении для hmac
 API_SECRET_BYTES = API_SECRET.encode('utf-8') if API_SECRET else None
 BASE_URL = "https://safe.trade/api/v2"
 CURRENCY_TO_SELL = "QTC"
 CURRENCY_TO_BUY = "USDT"
 MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
+TABLE_PREFIX = "miner_"
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 # Создаем экземпляр скрейпера для обхода защиты Cloudflare
 scraper = cloudscraper.create_scraper()
 # Инициализация бота Telegram
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# Инициализация Supabase клиента
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("[WARNING] Supabase URL или KEY не указаны. Запись в базу данных будет отключена.")
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 menu_markup.row('/balance', '/sell_qtc')
 menu_markup.row('/history', '/donate')
+
+
+# --- Функции для работы с Supabase ---
+def check_sale_record_exists(order_id):
+    """Проверяет, существует ли запись о продаже в Supabase."""
+    if not supabase:
+        return False
+
+    try:
+        table_name = f"{TABLE_PREFIX}sales"
+        response = supabase.table(table_name).select("*").eq("order_id", order_id).execute()
+        return len(response.data) > 0
+    except Exception as e:
+        print(f"Ошибка при проверке записи о продаже {order_id}: {e}")
+        return False
+
+
+def insert_sale_record(order_id, amount, total_sum, avg_price, executed_time):
+    """Записывает данные о продаже в Supabase."""
+    if not supabase:
+        print("[WARNING] Supabase не инициализирован. Запись невозможна.")
+        return False
+
+    try:
+        table_name = f"{TABLE_PREFIX}sales"
+        sale_data = {
+            "order_id": order_id,
+            "currency_sold": CURRENCY_TO_SELL,
+            "currency_bought": CURRENCY_TO_BUY,
+            "amount_sold": float(amount),
+            "total_received": float(total_sum),
+            "avg_price": float(avg_price),
+            "executed_at": executed_time,
+            "created_at": datetime.now().isoformat()
+        }
+        response = supabase.table(table_name).insert(sale_data).execute()
+        print(f"✅ Запись о продаже {order_id} успешно добавлена в Supabase")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при записи продажи {order_id} в Supabase: {e}")
+        return False
+
+
+def sync_missing_sales():
+    """Синхронизирует отсутствующие записи о продажах при старте программы."""
+    if not supabase:
+        print("[WARNING] Supabase не инициализирован. Синхронизация невозможна.")
+        return
+
+    print("🔍 Проверка отсутствующих записей о продажах...")
+    try:
+        # Получаем историю ордеров
+        orders = get_order_history(limit=50)  # Увеличиваем лимит для более глубокой проверки
+
+        if orders and isinstance(orders, list):
+            synced_count = 0
+            for order in orders:
+                order_id = order.get('id')
+                if order_id and order.get('state') == 'done' and order.get('side') == 'sell':
+                    # Проверяем, есть ли запись в Supabase
+                    if not check_sale_record_exists(order_id):
+                        # Получаем детальную информацию о сделках
+                        trades = get_order_trades(order_id)
+                        if trades and isinstance(trades, list) and len(trades) > 0:
+                            total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
+                            total_sum = sum(float(trade.get('total', 0)) for trade in trades)
+                            avg_price = total_sum / total_amount if total_amount > 0 else 0
+
+                            # Форматируем время исполнения
+                            created_at = order.get('created_at', 'N/A')
+                            try:
+                                dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
+                                executed_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            except:
+                                executed_time = created_at
+
+                            # Записываем в Supabase
+                            if insert_sale_record(order_id, total_amount, total_sum, avg_price, executed_time):
+                                synced_count += 1
+
+            if synced_count > 0:
+                print(f"✅ Синхронизировано {synced_count} записей о продажах")
+                try:
+                    bot.send_message(
+                        ADMIN_CHAT_ID,
+                        f"✅ *Синхронизация завершена!*\n\nДобавлено {synced_count} записей о продажах в базу данных.",
+                        parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    print(f"Ошибка отправки уведомления о синхронизации: {e}")
+            else:
+                print("✅ Все записи о продажах уже синхронизированы")
+    except Exception as e:
+        print(f"❌ Ошибка при синхронизации продаж: {e}")
 
 
 # --- Функции API SafeTrade ---
@@ -101,13 +204,10 @@ def create_sell_order_safetrade(amount):
         response = scraper.post(url, headers=headers, json=payload)
         response.raise_for_status()
         order_details = response.json()
-
         order_id = order_details.get('id')
         order_amount = order_details.get('amount', amount)
-
         if order_id:
             threading.Thread(target=track_order, args=(order_id,)).start()
-
         return (
             f"✅ *Успешно размещен ордер на продажу!*\n\n"
             f"*Биржа:* SafeTrade\n"
@@ -140,11 +240,10 @@ def get_order_info(order_id):
 
 def get_order_trades(order_id):
     """Получает сделки по конкретному ордеру, фильтруя общую историю сделок."""
-    path = "/trade/market/trades"  # ИСПРАВЛЕНО: Правильный эндпоинт
+    path = "/trade/market/trades"
     url = BASE_URL + path
     try:
         headers = get_auth_headers()
-        # ИСПРАВЛЕНО: Добавляем фильтрацию по ID ордера
         params = {"order_id": str(order_id)}
         response = scraper.get(url, headers=headers, params=params)
         response.raise_for_status()
@@ -173,14 +272,11 @@ def track_order(order_id):
     """Отслеживает статус ордера и уведомляет о его исполнении."""
     max_attempts = 30
     check_interval = 10
-
     for _ in range(max_attempts):
         time.sleep(check_interval)
         order_info = get_order_info(order_id)
-
         if not order_info:
             continue
-
         if order_info.get('state') == 'done':
             trades = get_order_trades(order_id)
             if trades:
@@ -188,6 +284,10 @@ def track_order(order_id):
                 total_sum = sum(float(trade.get('total', 0)) for trade in trades)
                 avg_price = total_sum / total_amount if total_amount > 0 else 0
                 executed_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Записываем данные о продаже в Supabase
+                if supabase:
+                    insert_sale_record(order_id, total_amount, total_sum, avg_price, executed_time)
 
                 message = (
                     f"✅ *Ордер исполнен!*\n\n"
@@ -198,7 +298,6 @@ def track_order(order_id):
                     f"*Средняя цена:* `{avg_price:.8f} {CURRENCY_TO_BUY}`\n"
                     f"*Время исполнения:* `{executed_time}`"
                 )
-
                 try:
                     bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
                 except Exception as e:
@@ -275,36 +374,29 @@ def handle_sell(message):
 def handle_history(message):
     """Обработчик команды /history с корректным отображением исполненных ордеров."""
     bot.send_message(message.chat.id, "🔍 Запрашиваю историю ордеров с SafeTrade...")
-
     orders = get_order_history(limit=10)
-
     if orders and isinstance(orders, list) and len(orders) > 0:
         history_text = "📊 *История ваших ордеров:*\n\n"
         for order in orders:
             order_id = order.get('id', 'N/A')
             created_at = order.get('created_at', 'N/A')
-
             try:
                 dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
                 formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
             except:
                 formatted_time = created_at
-
             amount_str = f"`{order.get('amount', 'N/A')}`"
             price_str = f"`{order.get('price', 'N/A')}`"
             total_str = f"`{order.get('total', 'N/A')}`"
-
             if order.get('state') == 'done':
                 trades = get_order_trades(order_id)
                 if trades and isinstance(trades, list) and len(trades) > 0:
                     total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
                     total_sum = sum(float(trade.get('total', 0)) for trade in trades)
                     avg_price = total_sum / total_amount if total_amount > 0 else 0
-
                     amount_str = f"`{total_amount:.8f}`"
                     price_str = f"`{avg_price:.8f}` (средняя)"
                     total_str = f"`{total_sum:.8f}`"
-
             history_text += (
                 f"*ID ордера:* `{order_id}`\n"
                 f"*Пара:* `{order.get('market', 'N/A').upper()}`\n"
@@ -316,7 +408,6 @@ def handle_history(message):
                 f"*Статус:* `{order.get('state', 'N/A').capitalize()}`\n"
                 f"*Время создания:* `{formatted_time}`\n\n"
             )
-
         bot.send_message(message.chat.id, history_text, parse_mode='Markdown')
     else:
         bot.send_message(message.chat.id, "История ордеров пуста.")
@@ -342,6 +433,12 @@ if __name__ == "__main__":
             "[CRITICAL] Не все переменные окружения установлены! Проверьте SAFETRADE_API_KEY, SAFETRADE_API_SECRET, TELEGRAM_BOT_TOKEN и ADMIN_CHAT_ID в файле .env")
     else:
         print("Бот SafeTrade запущен...")
+
+        # Синхронизация отсутствующих записей при старте
+        if supabase:
+            print("🔄 Запускаю синхронизацию записей о продажах...")
+            sync_missing_sales()
+
         try:
             start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             bot.send_message(
