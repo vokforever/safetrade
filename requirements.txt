@@ -4,3 +4,4 @@ cloudscraper==1.2.71
 python-dotenv==1.0.1
 apscheduler==3.10.4
 supabase
+pyTelegramBotAPI
