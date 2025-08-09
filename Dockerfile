@@ -18,6 +18,8 @@ COPY . .
 ENV SAFETRADE_API_KEY="dummy" \
     SAFETRADE_API_SECRET="dummy" \
     TELEGRAM_BOT_TOKEN="dummy" \
+    SUPABASE_URL="dummy" \
+    SUPABASE_KEY="dummy" \
     ADMIN_CHAT_ID="dummy"
 
 # Команда для запуска приложения при старте контейнера
