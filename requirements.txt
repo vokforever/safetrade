@@ -6,3 +6,8 @@ apscheduler==3.10.4
 supabase
 pyTelegramBotAPI
 cerebras_cloud_sdk
+pandas==2.1.4
+numpy==1.25.2
+aiohttp==3.9.1
+loguru==0.7.2
+pydantic==2.5.0
