@@ -20,6 +20,7 @@ ENV SAFETRADE_API_KEY="dummy" \
     TELEGRAM_BOT_TOKEN="dummy" \
     SUPABASE_URL="dummy" \
     SUPABASE_KEY="dummy" \
+    CEREBRAS_API_KEY="dummy" \
     ADMIN_CHAT_ID="dummy"
 
 # Команда для запуска приложения при старте контейнера
