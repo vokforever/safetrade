@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 supabase
 pyTelegramBotAPI
+cerebras_cloud_sdk
