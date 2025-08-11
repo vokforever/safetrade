@@ -4,7 +4,7 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 supabase==2.5.1
 pyTelegramBotAPI==4.15.2
-cerebras_cloud_sdk==0.6.0
+cerebras_cloud_sdk
 pandas==2.2.2
 numpy==1.26.4
 aiohttp==3.9.5
