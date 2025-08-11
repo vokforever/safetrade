@@ -29,6 +29,9 @@ import asyncio
 import aiohttp
 from collections import deque
 import yaml
+import socket
+import subprocess
+from urllib.parse import urlparse
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
@@ -40,9 +43,42 @@ logging.basicConfig(
     ]
 )
 
+# --- ФУНКЦИИ ПРОВЕРКИ СЕТЕВОГО ПОДКЛЮЧЕНИЯ ---
+def check_network_connectivity():
+    """Проверка сетевого подключения и DNS резолюции"""
+    try:
+        # Проверяем DNS резолюцию
+        socket.gethostbyname('api.telegram.org')
+        logging.info("DNS резолюция для api.telegram.org: ОК")
+        
+        # Проверяем HTTP подключение
+        response = requests.get('https://api.telegram.org', timeout=10)
+        logging.info("HTTP подключение к api.telegram.org: ОК")
+        return True
+    except socket.gaierror as e:
+        logging.error(f"DNS ошибка: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Сетевая ошибка: {e}")
+        return False
+
+def configure_dns():
+    """Конфигурация альтернативных DNS серверов"""
+    try:
+        # Для Linux контейнеров - добавляем Google DNS
+        dns_config = """
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+"""
+        with open('/etc/resolv.conf', 'a') as f:
+            f.write(dns_config)
+        logging.info("DNS серверы настроены")
+    except Exception as e:
+        logging.warning(f"Не удалось настроить DNS: {e}")
+
 # --- ЗАГРУЗКА КОНФИГУРАЦИИ ---
 load_dotenv()
-
 # Конфигурация по умолчанию
 DEFAULT_CONFIG = {
     'trading': {
@@ -123,13 +159,11 @@ markets_cache = {
     "last_update": None,
     "cache_duration": CONFIG['cache']['markets_duration']
 }
-
 prices_cache = {
     "data": {},
     "last_update": None,
     "cache_duration": CONFIG['cache']['prices_duration']
 }
-
 orderbook_cache = {
     "data": {},
     "last_update": {},
@@ -279,7 +313,7 @@ class DatabaseManager:
                 timestamp TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
-                type TEXT NOT NULL,
+                order_type TEXT NOT NULL,
                 amount REAL NOT NULL,
                 price REAL,
                 total REAL,
@@ -350,16 +384,21 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка сохранения цены: {e}")
     
-    def save_order_data(self, order_id, timestamp, symbol, side, type, amount, price, total, status):
+    def save_order_data(self, order_id, timestamp, symbol, side, order_type, amount, price, total, status):
         """Сохраняет данные об ордере в БД"""
+        # Валидация order_type
+        valid_types = ["market", "limit", "twap", "iceberg", "adaptive"]
+        if order_type not in valid_types:
+            raise ValueError(f"Недопустимый order_type: {order_type}. Допустимые: {valid_types}")
+        
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                 INSERT OR REPLACE INTO order_history 
-                (order_id, timestamp, symbol, side, type, amount, price, total, status, updated_at)
+                (order_id, timestamp, symbol, side, order_type, amount, price, total, status, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (order_id, timestamp, symbol, side, type, amount, price, total, status, datetime.now().isoformat()))
+                ''', (order_id, timestamp, symbol, side, order_type, amount, price, total, status, datetime.now().isoformat()))
                 conn.commit()
         except Exception as e:
             logging.error(f"Ошибка сохранения ордера: {e}")
@@ -402,10 +441,41 @@ class DatabaseManager:
 # Инициализация менеджера базы данных
 db_manager = DatabaseManager()
 
+# --- УЛУЧШЕННЫЙ TELEGRAM BOT С RETRY МЕХАНИЗМОМ ---
+class RobustTeleBot(telebot.TeleBot):
+    def __init__(self, token, **kwargs):
+        super().__init__(token, **kwargs)
+        
+    def infinity_polling_with_retry(self, timeout=20, long_polling_timeout=20, 
+                                   retry_attempts=5, retry_delay=30):
+        """Infinity polling с улучшенной обработкой ошибок"""
+        attempt = 0
+        while attempt < retry_attempts:
+            try:
+                logging.info(f"Запуск infinity polling (попытка {attempt + 1}/{retry_attempts})")
+                self.infinity_polling(timeout=timeout, long_polling_timeout=long_polling_timeout)
+                break
+            except requests.exceptions.ConnectionError as e:
+                attempt += 1
+                if "api.telegram.org" in str(e):
+                    logging.error(f"DNS/Connection ошибка (попытка {attempt}): {e}")
+                    if attempt < retry_attempts:
+                        logging.info(f"Повтор через {retry_delay} секунд...")
+                        time.sleep(retry_delay)
+                        # Увеличиваем задержку экспоненциально
+                        retry_delay *= 2
+                    else:
+                        logging.error("Исчерпаны все попытки подключения")
+                        raise
+                else:
+                    raise
+            except Exception as e:
+                logging.error(f"Неожиданная ошибка: {e}")
+                raise
+
 # --- ИНИЦИАЛИЗАЦИЯ ---
 scraper = cloudscraper.create_scraper()
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
+bot = RobustTeleBot(TELEGRAM_BOT_TOKEN)
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -424,6 +494,36 @@ menu_markup.row('/balance', '/sell_all')
 menu_markup.row('/history', '/ai_status')
 menu_markup.row('/markets', '/config')
 menu_markup.row('/donate', '/help')
+menu_markup.row('/health', '/restart')
+
+# --- WEBHOOK MODE AS FALLBACK ---
+def setup_webhook_mode():
+    """Настройка webhook режима как альтернативы polling"""
+    webhook_url = os.getenv("WEBHOOK_URL")  # Добавить в переменные окружения
+    webhook_port = int(os.getenv("WEBHOOK_PORT", "8443"))
+    
+    if webhook_url:
+        try:
+            bot.remove_webhook()
+            bot.set_webhook(url=webhook_url)
+            logging.info(f"Webhook настроен: {webhook_url}")
+            
+            from flask import Flask, request
+            app = Flask(__name__)
+            
+            @app.route('/' + TELEGRAM_BOT_TOKEN, methods=['POST'])
+            def webhook():
+                json_str = request.get_data().decode('UTF-8')
+                update = telebot.types.Update.de_json(json_str)
+                bot.process_new_updates([update])
+                return ''
+            
+            app.run(host='0.0.0.0', port=webhook_port)
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка настройки webhook: {e}")
+            return False
+    return False
 
 # --- Graceful shutdown ---
 def shutdown_handler(signum, frame):
@@ -1202,7 +1302,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             timestamp=datetime.now().isoformat(),
             symbol=order_details.get('market', 'N/A'),
             side=order_details.get('side', 'N/A'),
-            type=order_details.get('type', 'N/A'),
+            order_type=order_details.get('type', 'N/A'),
             amount=float(order_amount),
             price=float(order_details.get('price', 0)) if order_details.get('price') else None,
             total=float(order_details.get('total', 0)) if order_details.get('total') else None,
@@ -1251,7 +1351,7 @@ def track_order_execution(order_id, timeout=300):
                     timestamp=datetime.now().isoformat(),
                     symbol="N/A",
                     side="sell",
-                    type="N/A",
+                    order_type="N/A",
                     amount=0,
                     price=0,
                     total=total_executed,
@@ -1282,7 +1382,7 @@ def cancel_order(order_id):
             timestamp=datetime.now().isoformat(),
             symbol="N/A",
             side="sell",
-            type="N/A",
+            order_type="N/A",
             amount=0,
             price=0,
             total=0,
@@ -1496,9 +1596,7 @@ def send_welcome(message):
     """Приветственное сообщение"""
     welcome_text = """
 🤖 **Добро пожаловать в SafeTrade Trading Bot!**
-
 Этот бот поможет вам автоматизировать торговлю криптовалютами на бирже SafeTrade.
-
 **Доступные команды:**
 • `/balance` - показать текущие балансы
 • `/sell_all` - продать все альткоины за USDT
@@ -1506,20 +1604,40 @@ def send_welcome(message):
 • `/ai_status` - статус ИИ-помощника
 • `/markets` - показать доступные торговые пары
 • `/config` - показать текущую конфигурацию
+• `/health` - проверить состояние бота
+• `/restart` - перезапустить бота (админ)
 • `/donate` - поддержать разработчика
 • `/help` - показать эту справку
-
 **Возможности:**
 🎯 Умная приоритизация продаж
 🧠 ИИ-помощник для выбора стратегий
 📊 Несколько торговых стратегий
 🔄 Автоматическая торговля
 📈 Детальная аналитика
-
 Для начала работы используйте команду `/balance`
 """
     
     bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=menu_markup)
+
+@bot.message_handler(commands=['health'])
+def health_check(message):
+    """Проверка состояния бота"""
+    if str(message.chat.id) == ADMIN_CHAT_ID:
+        network_status = "✅ OK" if check_network_connectivity() else "❌ Error"
+        bot.reply_to(message, f"🤖 Бот: Активен\n🌐 Сеть: {network_status}")
+    else:
+        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+
+@bot.message_handler(commands=['restart'])
+def restart_bot(message):
+    """Перезапуск бота"""
+    if str(message.chat.id) == ADMIN_CHAT_ID:
+        bot.reply_to(message, "🔄 Перезапуск бота...")
+        logging.info("Перезапуск бота по команде администратора")
+        # Используем graceful shutdown
+        shutdown_handler(signal.SIGINT, None)
+    else:
+        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
 @bot.message_handler(commands=['balance'])
 def show_balance(message):
@@ -1546,7 +1664,7 @@ def show_balance(message):
                 f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
             )
         
-        response += f"💵 **Общая стоимость: ${total_usd:.2f}**"
+        response += f"💵 **Общая стоимость: ${total_usd:.2f}`**"
         
         bot.reply_to(message, response, parse_mode='Markdown')
     
@@ -1595,7 +1713,7 @@ def show_history(message):
         with db_manager.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-            SELECT order_id, timestamp, symbol, side, type, amount, price, total, status
+            SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
             FROM order_history
             ORDER BY created_at DESC
             LIMIT 10
@@ -1744,18 +1862,14 @@ def show_donate(message):
     """Показывает информацию о пожертвованиях"""
     donate_text = f"""
 💖 **Поддержите разработчика!**
-
 Если этот бот помог вам в торговле, вы можете поддержать разработку:
-
 🔗 **Ссылка для пожертвований:**
 {DONATE_URL}
-
 Ваша поддержка поможет:
 • 🔧 Улучшить функционал бота
 • 🧠 Добавить новые ИИ-возможности  
 • 🐛 Быстрее исправлять ошибки
 • 📈 Разработать новые стратегии торговли
-
 **Спасибо за вашу поддержку! ❤️**
 """
     
@@ -1772,6 +1886,31 @@ def handle_all_messages(message):
     )
 
 # --- ЗАПУСК БОТА ---
+def start_bot():
+    """Улучшенный запуск бота с проверками"""
+    # Проверяем сетевое подключение
+    if not check_network_connectivity():
+        logging.warning("Проблемы с сетью, настраиваем DNS...")
+        configure_dns()
+        time.sleep(10)  # Ждем применения настроек
+        
+        if not check_network_connectivity():
+            logging.error("Не удалось восстановить сетевое подключение")
+            # Пробуем webhook режим
+            if setup_webhook_mode():
+                logging.info("Переключились на webhook режим")
+                return
+            else:
+                logging.error("Webhook режим недоступен")
+                sys.exit(1)
+    
+    # Запускаем с retry механизмом
+    try:
+        bot.infinity_polling_with_retry()
+    except Exception as e:
+        logging.error(f"Критическая ошибка бота: {e}")
+        sys.exit(1)
+
 def main():
     """Главная функция запуска"""
     try:
@@ -1808,7 +1947,7 @@ def main():
         logging.info("Бот успешно запущен и готов к работе")
         
         # Запускаем бота
-        bot.polling(none_stop=True, interval=1, timeout=60)
+        start_bot()
         
     except KeyboardInterrupt:
         logging.info("Получен сигнал прерывания")
