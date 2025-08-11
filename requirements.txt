@@ -1,11 +1,10 @@
-aiogram==3.10.0
 requests==2.32.3
 cloudscraper==1.2.71
 python-dotenv==1.0.1
 apscheduler==3.10.4
 supabase==2.5.1
 pyTelegramBotAPI==4.15.2
-cerebras_cloud_sdk
+cerebras_cloud_sdk==0.6.0
 pandas==2.2.2
 numpy==1.26.4
 aiohttp==3.9.5
