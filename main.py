@@ -7,22 +7,133 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 import cloudscraper
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 from supabase import create_client, Client
 from cerebras.cloud.sdk import Cerebras
 import requests
 import sqlite3
 from pathlib import Path
+import random
+import math
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
+import logging
+import sys
+import signal
+from threading import Lock, Semaphore
+from tenacity import retry, stop_after_attempt, wait_exponential
+from contextlib import contextmanager
+import asyncio
+import aiohttp
+from collections import deque
+import yaml
+import socket
+import subprocess
+from urllib.parse import urlparse
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# --- ФУНКЦИИ ПРОВЕРКИ СЕТЕВОГО ПОДКЛЮЧЕНИЯ ---
+def check_network_connectivity():
+    """Проверка сетевого подключения и DNS резолюции"""
+    try:
+        # Проверяем DNS резолюцию
+        socket.gethostbyname('api.telegram.org')
+        logging.info("DNS резолюция для api.telegram.org: ОК")
+        
+        # Проверяем HTTP подключение
+        response = requests.get('https://api.telegram.org', timeout=10)
+        logging.info("HTTP подключение к api.telegram.org: ОК")
+        return True
+    except socket.gaierror as e:
+        logging.error(f"DNS ошибка: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"Сетевая ошибка: {e}")
+        return False
+
+def configure_dns():
+    """Конфигурация альтернативных DNS серверов"""
+    try:
+        # Для Linux контейнеров - добавляем Google DNS
+        dns_config = """
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+"""
+        with open('/etc/resolv.conf', 'a') as f:
+            f.write(dns_config)
+        logging.info("DNS серверы настроены")
+    except Exception as e:
+        logging.warning(f"Не удалось настроить DNS: {e}")
+
+# --- ЗАГРУЗКА КОНФИГУРАЦИИ ---
 load_dotenv()
+# Конфигурация по умолчанию
+DEFAULT_CONFIG = {
+    'trading': {
+        'excluded_currencies': ['USDT', 'BUSD', 'USDC'],
+        'min_position_value_usd': 1.0,
+        'max_concurrent_sales': 3,
+        'auto_sell_interval': 3600,
+        'strategies': {
+            'twap': {
+                'default_duration': 60,
+                'default_chunks': 6
+            },
+            'iceberg': {
+                'default_visible_ratio': 0.1,
+                'max_attempts': 20
+            },
+            'adaptive': {
+                'max_price_levels': 10,
+                'liquidity_ratio': 0.1
+            }
+        }
+    },
+    'risk_management': {
+        'max_position_value': 10000,
+        'min_spread_threshold': 0.001,
+        'max_volatility_threshold': 0.05
+    },
+    'cache': {
+        'markets_duration': 14400,  # 4 часа
+        'prices_duration': 300,     # 5 минут
+        'orderbook_duration': 60    # 1 минута
+    }
+}
+
+# Загрузка конфигурации из файла
+def load_config():
+    config_path = Path("config.yml")
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                custom_config = yaml.safe_load(f)
+            # Объединяем с конфигурацией по умолчанию
+            return {**DEFAULT_CONFIG, **custom_config}
+        except Exception as e:
+            logging.warning(f"Ошибка загрузки конфигурации: {e}. Используется конфигурация по умолчанию.")
+    return DEFAULT_CONFIG
+
+CONFIG = load_config()
+
 # Загружаем токены и ID из переменных окружения
 API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # ID администратора для уведомлений
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")  # API ключ для Cerebras
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 
 # Supabase настройки
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -34,349 +145,449 @@ DONATE_URL = "https://boosty.to/vokforever/donate"
 # Убедимся, что секрет в байтовом представлении для hmac
 API_SECRET_BYTES = API_SECRET.encode('utf-8') if API_SECRET else None
 BASE_URL = "https://safe.trade/api/v2"
-CURRENCY_TO_SELL = "QTC"
-CURRENCY_TO_BUY = "USDT"
-MARKET_SYMBOL = f"{CURRENCY_TO_SELL.lower()}{CURRENCY_TO_BUY.lower()}"
-TABLE_PREFIX = "miner_"
+
+# Настройки из конфигурации
+EXCLUDED_CURRENCIES = CONFIG['trading']['excluded_currencies']
+MIN_POSITION_VALUE_USD = CONFIG['trading']['min_position_value_usd']
+MAX_CONCURRENT_SALES = CONFIG['trading']['max_concurrent_sales']
+AUTO_SELL_INTERVAL = CONFIG['trading']['auto_sell_interval']
+
+# Кэширование с locks для thread safety
+cache_lock = Lock()
+markets_cache = {
+    "data": [],
+    "last_update": None,
+    "cache_duration": CONFIG['cache']['markets_duration']
+}
+prices_cache = {
+    "data": {},
+    "last_update": None,
+    "cache_duration": CONFIG['cache']['prices_duration']
+}
+orderbook_cache = {
+    "data": {},
+    "last_update": {},
+    "cache_duration": CONFIG['cache']['orderbook_duration']
+}
+
+# Semaphore для ограничения concurrent продаж
+sales_sem = Semaphore(MAX_CONCURRENT_SALES)
+
+# Стратегии продаж
+class SellStrategy(Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+    TWAP = "twap"
+    ICEBERG = "iceberg"
+    ADAPTIVE = "adaptive"
+
+class OrderStatus(Enum):
+    PENDING = "pending"
+    PARTIAL = "partial"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+@dataclass
+class MarketData:
+    symbol: str
+    current_price: float
+    volatility: float
+    volume_24h: float
+    bid_depth: float
+    ask_depth: float
+    spread: float
+    
+    def to_dict(self):
+        return asdict(self)
+
+@dataclass
+class BalanceInfo:
+    currency: str
+    balance: float
+    usd_value: float
+    market_symbol: str
+
+@dataclass
+class PriorityScore:
+    currency: str
+    balance: float
+    usd_value: float
+    priority_score: float
+    market_data: MarketData
+
+@dataclass
+class TradingDecision:
+    strategy: SellStrategy
+    parameters: Dict[str, Any]
+    reasoning: str
+    confidence: float
+
+# Улучшенный Rate Limiter для Cerebras
+class RateLimiter:
+    def __init__(self, requests_per_min=30, tokens_per_min=60000):
+        self.requests_per_min = requests_per_min
+        self.tokens_per_min = tokens_per_min
+        self.request_times = deque()
+        self.token_usage = deque()
+        self.lock = Lock()
+    
+    def can_make_request(self, estimated_tokens=1000):
+        with self.lock:
+            now = time.time()
+            minute_ago = now - 60
+            
+            # Очищаем старые записи
+            while self.request_times and self.request_times[0] < minute_ago:
+                self.request_times.popleft()
+            
+            while self.token_usage and self.token_usage[0][0] < minute_ago:
+                self.token_usage.popleft()
+            
+            # Проверяем лимиты
+            current_requests = len(self.request_times)
+            current_tokens = sum(usage[1] for usage in self.token_usage)
+            
+            return (current_requests < self.requests_per_min and 
+                    current_tokens + estimated_tokens < self.tokens_per_min)
+    
+    def record_usage(self, tokens_used):
+        with self.lock:
+            now = time.time()
+            self.request_times.append(now)
+            self.token_usage.append((now, tokens_used))
 
 # Настройки для Cerebras API
 CEREBRAS_MODEL = "qwen-3-235b-a22b-thinking-2507"
-CEREBRAS_FREE_TIER_LIMITS = {
-    "requests_per_min": 30,
-    "input_tokens_per_min": 60000,
-    "output_tokens_per_min": 8000,
-    "daily_tokens": 1000000
-}
+cerebras_limiter = RateLimiter()
 
-# Путь к файлу для хранения логов ИИ
-AI_LOGS_PATH = Path("ai_decision_logs.json")
-if not AI_LOGS_PATH.exists():
-    with open(AI_LOGS_PATH, "w") as f:
-        json.dump([], f)
+# --- УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ ---
+class DatabaseManager:
+    def __init__(self, db_path="trading_analytics.db"):
+        self.db_path = db_path
+        self.lock = Lock()
+        self.init_database()
+    
+    @contextmanager
+    def get_connection(self):
+        """Контекстный менеджер для безопасной работы с БД"""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            yield conn
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            logging.error(f"Ошибка базы данных: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+    
+    def init_database(self):
+        """Инициализация базы данных"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Создание таблицы для хранения исторических данных о ценах
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                price REAL NOT NULL,
+                volume REAL,
+                high REAL,
+                low REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX(symbol, timestamp)
+            )
+            ''')
+            
+            # Создание таблицы для хранения истории ордеров
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS order_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                price REAL,
+                total REAL,
+                status TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX(order_id),
+                INDEX(symbol, timestamp)
+            )
+            ''')
+            
+            # Создание таблицы для хранения решений ИИ
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS ai_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                decision_type TEXT NOT NULL,
+                decision_data TEXT NOT NULL,
+                market_data TEXT,
+                reasoning TEXT,
+                confidence REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX(decision_type, timestamp)
+            )
+            ''')
+            
+            # Создание таблицы для хранения торговых пар
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trading_pairs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL UNIQUE,
+                base_currency TEXT NOT NULL,
+                quote_currency TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                last_updated TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX(symbol),
+                INDEX(base_currency)
+            )
+            ''')
+            
+            # Создание таблицы для метрик производительности
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS performance_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                metric_type TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                value REAL NOT NULL,
+                metadata TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX(metric_type, timestamp)
+            )
+            ''')
+            
+            conn.commit()
+    
+    def save_price_data(self, symbol, price, volume=None, high=None, low=None):
+        """Сохраняет данные о цене в БД"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                INSERT INTO price_history (timestamp, symbol, price, volume, high, low)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''', (datetime.now().isoformat(), symbol, price, volume, high, low))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения цены: {e}")
+    
+    def save_order_data(self, order_id, timestamp, symbol, side, order_type, amount, price, total, status):
+        """Сохраняет данные об ордере в БД"""
+        # Валидация order_type
+        valid_types = ["market", "limit", "twap", "iceberg", "adaptive"]
+        if order_type not in valid_types:
+            raise ValueError(f"Недопустимый order_type: {order_type}. Допустимые: {valid_types}")
+        
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                INSERT OR REPLACE INTO order_history 
+                (order_id, timestamp, symbol, side, order_type, amount, price, total, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (order_id, timestamp, symbol, side, order_type, amount, price, total, status, datetime.now().isoformat()))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения ордера: {e}")
+    
+    def save_ai_decision(self, decision_type, decision_data, market_data, reasoning, confidence=0.0):
+        """Сохраняет решение ИИ в БД"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                INSERT INTO ai_decisions (timestamp, decision_type, decision_data, market_data, reasoning, confidence)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    datetime.now().isoformat(), 
+                    decision_type, 
+                    json.dumps(decision_data), 
+                    json.dumps(market_data), 
+                    reasoning,
+                    confidence
+                ))
+                conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения решения ИИ: {e}")
+    
+    def get_recent_ai_decisions(self, limit=10):
+        """Получает последние решения ИИ"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                SELECT * FROM ai_decisions 
+                ORDER BY created_at DESC 
+                LIMIT ?
+                ''', (limit,))
+                return cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Ошибка получения решений ИИ: {e}")
+            return []
+
+# Инициализация менеджера базы данных
+db_manager = DatabaseManager()
+
+# --- УЛУЧШЕННЫЙ TELEGRAM BOT С RETRY МЕХАНИЗМОМ ---
+class RobustTeleBot(telebot.TeleBot):
+    def __init__(self, token, **kwargs):
+        super().__init__(token, **kwargs)
+        
+    def infinity_polling_with_retry(self, timeout=20, long_polling_timeout=20, 
+                                   retry_attempts=5, retry_delay=30):
+        """Infinity polling с улучшенной обработкой ошибок"""
+        attempt = 0
+        while attempt < retry_attempts:
+            try:
+                logging.info(f"Запуск infinity polling (попытка {attempt + 1}/{retry_attempts})")
+                self.infinity_polling(timeout=timeout, long_polling_timeout=long_polling_timeout)
+                break
+            except requests.exceptions.ConnectionError as e:
+                attempt += 1
+                if "api.telegram.org" in str(e):
+                    logging.error(f"DNS/Connection ошибка (попытка {attempt}): {e}")
+                    if attempt < retry_attempts:
+                        logging.info(f"Повтор через {retry_delay} секунд...")
+                        time.sleep(retry_delay)
+                        # Увеличиваем задержку экспоненциально
+                        retry_delay *= 2
+                    else:
+                        logging.error("Исчерпаны все попытки подключения")
+                        raise
+                else:
+                    raise
+            except Exception as e:
+                logging.error(f"Неожиданная ошибка: {e}")
+                raise
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
-# Создаем экземпляр скрейпера для обхода защиты Cloudflare
 scraper = cloudscraper.create_scraper()
-
-# Инициализация бота Telegram
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-# Инициализация Supabase клиента
+bot = RobustTeleBot(TELEGRAM_BOT_TOKEN)
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 else:
-    print("[WARNING] Supabase URL или KEY не указаны. Запись в базу данных будет отключена.")
+    logging.warning("Supabase URL или KEY не указаны. Запись в базу данных будет отключена.")
 
-# Инициализация Cerebras клиента
 cerebras_client = None
 if CEREBRAS_API_KEY:
     cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
 else:
-    print("[WARNING] CEREBRAS_API_KEY не указан. Функции ИИ будут отключены.")
-
-
-# Инициализация локальной базы данных для аналитики
-def init_local_db():
-    """Инициализация локальной базы данных SQLite для аналитики"""
-    conn = sqlite3.connect('trading_analytics.db')
-    cursor = conn.cursor()
-
-    # Создание таблицы для хранения исторических данных о ценах
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS price_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        price REAL NOT NULL,
-        volume REAL,
-        high REAL,
-        low REAL
-    )
-    ''')
-
-    # Создание таблицы для хранения истории ордеров
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS order_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT NOT NULL,
-        timestamp TEXT NOT NULL,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        type TEXT NOT NULL,
-        amount REAL NOT NULL,
-        price REAL,
-        total REAL,
-        status TEXT NOT NULL
-    )
-    ''')
-
-    # Создание таблицы для хранения решений ИИ
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS ai_decisions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT NOT NULL,
-        decision_type TEXT NOT NULL,
-        decision_data TEXT NOT NULL,
-        market_data TEXT,
-        reasoning TEXT
-    )
-    ''')
-
-    conn.commit()
-    conn.close()
-
-
-init_local_db()
+    logging.warning("CEREBRAS_API_KEY не указан. Функции ИИ будут отключены.")
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-menu_markup.row('/balance', '/sell_qtc')
+menu_markup.row('/balance', '/sell_all')
 menu_markup.row('/history', '/ai_status')
-menu_markup.row('/donate')
+menu_markup.row('/markets', '/config')
+menu_markup.row('/donate', '/help')
+menu_markup.row('/health', '/restart')
 
+# --- WEBHOOK MODE AS FALLBACK ---
+def setup_webhook_mode():
+    """Настройка webhook режима как альтернативы polling"""
+    webhook_url = os.getenv("WEBHOOK_URL")  # Добавить в переменные окружения
+    webhook_port = int(os.getenv("WEBHOOK_PORT", "8443"))
+    
+    if webhook_url:
+        try:
+            bot.remove_webhook()
+            bot.set_webhook(url=webhook_url)
+            logging.info(f"Webhook настроен: {webhook_url}")
+            
+            from flask import Flask, request
+            app = Flask(__name__)
+            
+            @app.route('/' + TELEGRAM_BOT_TOKEN, methods=['POST'])
+            def webhook():
+                json_str = request.get_data().decode('UTF-8')
+                update = telebot.types.Update.de_json(json_str)
+                bot.process_new_updates([update])
+                return ''
+            
+            app.run(host='0.0.0.0', port=webhook_port)
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка настройки webhook: {e}")
+            return False
+    return False
 
-# --- Функции для работы с локальной базой данных ---
-def save_price_data(symbol, price, volume=None, high=None, low=None):
-    """Сохранение данных о ценах в локальную базу данных"""
+# --- Graceful shutdown ---
+def shutdown_handler(signum, frame):
+    logging.info("Завершение бота...")
     try:
-        conn = sqlite3.connect('trading_analytics.db')
-        cursor = conn.cursor()
+        # Отменяем все активные ордера
+        cancel_all_active_orders()
+        # Сохраняем состояние кэша
+        save_cache_state()
+    except Exception as e:
+        logging.error(f"Ошибка при завершении: {e}")
+    sys.exit(0)
 
-        timestamp = datetime.now().isoformat()
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
 
-        cursor.execute('''
-        INSERT INTO price_history (timestamp, symbol, price, volume, high, low)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', (timestamp, symbol, price, volume, high, low))
-
-        conn.commit()
-        conn.close()
+# --- ВАЛИДАЦИЯ ПАРАМЕТРОВ ---
+class OrderValidator:
+    @staticmethod
+    def validate_order_params(symbol, amount, order_type="market", price=None):
+        """Валидация параметров ордера"""
+        if not symbol or not isinstance(symbol, str):
+            raise ValueError("Symbol должен быть строкой")
+        
+        if amount <= 0:
+            raise ValueError("Amount должен быть положительным числом")
+        
+        if order_type not in ["market", "limit"]:
+            raise ValueError("Order type должен быть 'market' или 'limit'")
+        
+        if order_type == "limit":
+            if price is None or price <= 0:
+                raise ValueError("Для limit ордера price должен быть положительным")
+        
+        # Проверяем минимальный размер ордера
+        if amount * (price or 1) < MIN_POSITION_VALUE_USD:
+            raise ValueError(f"Размер ордера меньше минимального ({MIN_POSITION_VALUE_USD} USD)")
+        
         return True
-    except Exception as e:
-        print(f"Ошибка при сохранении данных о ценах: {e}")
-        return False
-
-
-def save_order_data(order_id, timestamp, symbol, side, type_, amount, price=None, total=None, status=None):
-    """Сохранение данных об ордерах в локальную базу данных"""
-    try:
-        conn = sqlite3.connect('trading_analytics.db')
-        cursor = conn.cursor()
-
-        cursor.execute('''
-        INSERT INTO order_history (order_id, timestamp, symbol, side, type, amount, price, total, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (order_id, timestamp, symbol, side, type_, amount, price, total, status))
-
-        conn.commit()
-        conn.close()
+    
+    @staticmethod
+    def validate_market_conditions(market_data: MarketData):
+        """Валидация рыночных условий"""
+        if market_data.spread > CONFIG['risk_management']['max_spread_threshold']:
+            logging.warning(f"Высокий спред для {market_data.symbol}: {market_data.spread:.4f}")
+        
+        if market_data.volatility > CONFIG['risk_management']['max_volatility_threshold']:
+            logging.warning(f"Высокая волатильность для {market_data.symbol}: {market_data.volatility:.4f}")
+        
+        if market_data.volume_24h < 1000:  # Минимальный объем торгов
+            logging.warning(f"Низкий объем торгов для {market_data.symbol}: {market_data.volume_24h}")
+        
         return True
-    except Exception as e:
-        print(f"Ошибка при сохранении данных об ордере: {e}")
-        return False
 
+order_validator = OrderValidator()
 
-def save_ai_decision(decision_type, decision_data, market_data=None, reasoning=None):
-    """Сохранение решений ИИ в локальную базу данных и JSON файл"""
-    try:
-        # Сохранение в SQLite
-        conn = sqlite3.connect('trading_analytics.db')
-        cursor = conn.cursor()
-
-        timestamp = datetime.now().isoformat()
-
-        cursor.execute('''
-        INSERT INTO ai_decisions (timestamp, decision_type, decision_data, market_data, reasoning)
-        VALUES (?, ?, ?, ?, ?)
-        ''', (timestamp, decision_type, json.dumps(decision_data),
-              json.dumps(market_data) if market_data else None, reasoning))
-
-        conn.commit()
-        conn.close()
-
-        # Сохранение в JSON файл
-        with open(AI_LOGS_PATH, "r") as f:
-            logs = json.load(f)
-
-        new_log_entry = {
-            "timestamp": timestamp,
-            "decision_type": decision_type,
-            "decision_data": decision_data,
-            "market_data": market_data,
-            "reasoning": reasoning
-        }
-
-        logs.append(new_log_entry)
-
-        with open(AI_LOGS_PATH, "w") as f:
-            json.dump(logs, f, indent=2)
-
-        return True
-    except Exception as e:
-        print(f"Ошибка при сохранении решения ИИ: {e}")
-        return False
-
-
-def get_price_history(symbol, limit=100):
-    """Получение истории цен из локальной базы данных"""
-    try:
-        conn = sqlite3.connect('trading_analytics.db')
-        cursor = conn.cursor()
-
-        cursor.execute('''
-        SELECT timestamp, price, volume, high, low
-        FROM price_history
-        WHERE symbol = ?
-        ORDER BY timestamp DESC
-        LIMIT ?
-        ''', (symbol, limit))
-
-        data = cursor.fetchall()
-        conn.close()
-
-        return [
-            {
-                "timestamp": row[0],
-                "price": row[1],
-                "volume": row[2],
-                "high": row[3],
-                "low": row[4]
-            }
-            for row in data
-        ]
-    except Exception as e:
-        print(f"Ошибка при получении истории цен: {e}")
-        return []
-
-
-def get_recent_ai_decisions(limit=10):
-    """Получение последних решений ИИ из локальной базы данных"""
-    try:
-        conn = sqlite3.connect('trading_analytics.db')
-        cursor = conn.cursor()
-
-        cursor.execute('''
-        SELECT timestamp, decision_type, decision_data, market_data, reasoning
-        FROM ai_decisions
-        ORDER BY timestamp DESC
-        LIMIT ?
-        ''', (limit,))
-
-        data = cursor.fetchall()
-        conn.close()
-
-        return [
-            {
-                "timestamp": row[0],
-                "decision_type": row[1],
-                "decision_data": json.loads(row[2]) if row[2] else None,
-                "market_data": json.loads(row[3]) if row[3] else None,
-                "reasoning": row[4]
-            }
-            for row in data
-        ]
-    except Exception as e:
-        print(f"Ошибка при получении решений ИИ: {e}")
-        return []
-
-
-# --- Функции для работы с Supabase ---
-def check_sale_record_exists(order_id):
-    """Проверяет, существует ли запись о продаже в Supabase."""
-    if not supabase:
-        return False
-    try:
-        table_name = f"{TABLE_PREFIX}sales"
-        response = supabase.table(table_name).select("*").eq("order_id", order_id).execute()
-        return len(response.data) > 0
-    except Exception as e:
-        print(f"Ошибка при проверке записи о продаже {order_id}: {e}")
-        return False
-
-
-def insert_sale_record(order_id, amount, total_sum, avg_price, executed_time):
-    """Записывает данные о продаже в Supabase."""
-    if not supabase:
-        print("[WARNING] Supabase не инициализирован. Запись невозможна.")
-        return False
-    try:
-        table_name = f"{TABLE_PREFIX}sales"
-        sale_data = {
-            "order_id": order_id,
-            "currency_sold": CURRENCY_TO_SELL,
-            "currency_bought": CURRENCY_TO_BUY,
-            "amount_sold": float(amount),
-            "total_received": float(total_sum),
-            "avg_price": float(avg_price),
-            "executed_at": executed_time,
-            "created_at": datetime.now().isoformat()
-        }
-        response = supabase.table(table_name).insert(sale_data).execute()
-        print(f"✅ Запись о продаже {order_id} успешно добавлена в Supabase")
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка при записи продажи {order_id} в Supabase: {e}")
-        return False
-
-
-def sync_missing_sales():
-    """Синхронизирует отсутствующие записи о продажах при старте программы."""
-    if not supabase:
-        print("[WARNING] Supabase не инициализирован. Синхронизация невозможна.")
-        return
-    print("🔍 Проверка отсутствующих записей о продажах...")
-    try:
-        # Получаем историю ордеров
-        orders = get_order_history(limit=50)  # Увеличиваем лимит для более глубокой проверки
-        if orders and isinstance(orders, list):
-            synced_count = 0
-            for order in orders:
-                order_id = order.get('id')
-                if order_id and order.get('state') == 'done' and order.get('side') == 'sell':
-                    # Проверяем, есть ли запись в Supabase
-                    if not check_sale_record_exists(order_id):
-                        # Получаем детальную информацию о сделках
-                        trades = get_order_trades(order_id)
-                        if trades and isinstance(trades, list) and len(trades) > 0:
-                            total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
-                            total_sum = sum(float(trade.get('total', 0)) for trade in trades)
-                            avg_price = total_sum / total_amount if total_amount > 0 else 0
-                            # Форматируем время исполнения
-                            created_at = order.get('created_at', 'N/A')
-                            try:
-                                dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
-                                executed_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-                            except:
-                                executed_time = created_at
-                            # Записываем в Supabase
-                            if insert_sale_record(order_id, total_amount, total_sum, avg_price, executed_time):
-                                synced_count += 1
-            if synced_count > 0:
-                print(f"✅ Синхронизировано {synced_count} записей о продажах")
-                try:
-                    bot.send_message(
-                        ADMIN_CHAT_ID,
-                        f"✅ *Синхронизация завершена!*\n\nДобавлено {synced_count} записей о продажах в базу данных.",
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    print(f"Ошибка отправки уведомления о синхронизации: {e}")
-            else:
-                print("✅ Все записи о продажах уже синхронизированы")
-    except Exception as e:
-        print(f"❌ Ошибка при синхронизации продаж: {e}")
-
-
-# --- Функции API SafeTrade ---
+# --- Функции для работы с API SafeTrade ---
 def generate_signature(nonce, key, secret_bytes):
-    """Генерирует подпись HMAC-SHA256."""
+    """Генерирует подпись HMAC-SHA256"""
     string_to_sign = nonce + key
     return hmac.new(secret_bytes, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
 
-
 def get_auth_headers():
-    """Собирает все заголовки для аутентификации."""
+    """Собирает все заголовки для аутентификации"""
     nonce = str(int(time.time() * 1000))
     signature = generate_signature(nonce, API_KEY, API_SECRET_BYTES)
     return {
@@ -386,933 +597,1367 @@ def get_auth_headers():
         'Content-Type': 'application/json'
     }
 
-
-def get_balances_safetrade():
-    """Получает и форматирует ненулевые балансы."""
-    path = "/trade/account/balances/spot"
-    url = BASE_URL + path
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_all_markets():
+    """Получает все доступные торговые пары с биржи"""
+    global markets_cache
+    
+    with cache_lock:
+        if (markets_cache["data"] and 
+            markets_cache["last_update"] and 
+            time.time() - markets_cache["last_update"] < markets_cache["cache_duration"]):
+            return markets_cache["data"]
+    
     try:
+        path = "/public/markets"
+        url = BASE_URL + path
+        response = scraper.get(url, timeout=30)
+        response.raise_for_status()
+        markets = response.json()
+        
+        if isinstance(markets, list):
+            # Фильтруем только пары с USDT
+            usdt_markets = [
+                market for market in markets 
+                if market.get('quote_unit') == 'usdt' and 
+                   market.get('base_unit', '').upper() not in EXCLUDED_CURRENCIES
+            ]
+            
+            with cache_lock:
+                markets_cache["data"] = usdt_markets
+                markets_cache["last_update"] = time.time()
+            
+            # Сохраняем в базу данных
+            save_markets_to_db(usdt_markets)
+            
+            return usdt_markets
+    except Exception as e:
+        logging.error(f"Ошибка при получении торговых пар: {e}")
+        # В случае ошибки, пробуем получить из базы данных
+        return get_markets_from_db()
+    
+    return []
+
+def save_markets_to_db(markets):
+    """Сохраняет торговые пары в базу данных"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            for market in markets:
+                cursor.execute('''
+                INSERT OR REPLACE INTO trading_pairs 
+                (symbol, base_currency, quote_currency, is_active, last_updated)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    market.get('id', ''),
+                    market.get('base_unit', ''),
+                    market.get('quote_currency', ''),
+                    True,
+                    datetime.now().isoformat()
+                ))
+            
+            conn.commit()
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении торговых пар: {e}")
+
+def get_markets_from_db():
+    """Получает торговые пары из базы данных"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            SELECT symbol, base_currency, quote_currency, is_active
+            FROM trading_pairs
+            WHERE is_active = 1
+            ''')
+            
+            markets = []
+            for row in cursor.fetchall():
+                markets.append({
+                    'id': row[0],
+                    'base_unit': row[1],
+                    'quote_unit': row[2],
+                    'active': row[3]
+                })
+            
+            return markets
+    except Exception as e:
+        logging.error(f"Ошибка при получении торговых пар из БД: {e}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_sellable_balances():
+    """Получает балансы всех криптовалют кроме USDT"""
+    try:
+        path = "/trade/account/balances/spot"
+        url = BASE_URL + path
         headers = get_auth_headers()
-        response = scraper.get(url, headers=headers)
+        response = scraper.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         balances = response.json()
-        if isinstance(balances, list):
-            non_zero_balances = [
-                f"{b.get('currency', '').upper()}: `{b.get('balance', '0')}`"
-                for b in balances if float(b.get('balance', 0)) > 0
-            ]
-            if non_zero_balances:
-                return "Ваши ненулевые балансы на SafeTrade:\n\n" + "\n".join(non_zero_balances)
-            else:
-                return "У вас нет ненулевых балансов на SafeTrade."
-        else:
-            return f"Ошибка: получен неожиданный формат данных от SafeTrade: {balances}"
+        
+        if not isinstance(balances, list):
+            logging.warning("Некорректный формат балансов")
+            return None
+        
+        # Получаем доступные торговые пары
+        markets = get_all_markets()
+        available_currencies = {market.get('base_unit', '').upper() for market in markets}
+        
+        sellable_balances = {}
+        for balance in balances:
+            currency = balance.get('currency', '').upper()
+            balance_amount = float(balance.get('balance', 0))
+            
+            # Пропускаем исключенные валюты и нулевые балансы
+            if (currency in EXCLUDED_CURRENCIES or 
+                balance_amount <= 0 or
+                currency not in available_currencies):
+                continue
+            
+            sellable_balances[currency] = balance_amount
+        
+        if sellable_balances:
+            logging.info(f"Найдены продаваемые балансы: {sellable_balances}")
+            return sellable_balances
+        
+        return None
     except Exception as e:
-        error_message = f"❌ Ошибка при получении балансов с SafeTrade: {e}"
-        if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: {e.response.text}"
-        return error_message
+        logging.error(f"Ошибка при получении балансов: {e}")
+        return None
 
-
-def create_sell_order_safetrade(amount, order_type="market", price=None):
-    """Создает ордер на продажу и возвращает отформатированный результат."""
-    path = "/trade/market/orders"
-    url = BASE_URL + path
-
-    payload = {
-        "market": MARKET_SYMBOL,
-        "side": "sell",
-        "type": order_type,
-        "amount": str(amount)
-    }
-
-    if order_type == "limit" and price:
-        payload["price"] = str(price)
-
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_ticker_price(symbol):
+    """Получает текущую цену для указанной торговой пары"""
+    global prices_cache
+    
+    with cache_lock:
+        if (symbol in prices_cache["data"] and 
+            prices_cache["last_update"] and 
+            time.time() - prices_cache["last_update"] < prices_cache["cache_duration"]):
+            return prices_cache["data"][symbol]
+    
     try:
+        path = f"/public/markets/{symbol}/tickers"
+        url = BASE_URL + path
+        response = scraper.get(url, timeout=30)
+        response.raise_for_status()
+        ticker = response.json()
+        
+        if not isinstance(ticker, dict):
+            logging.warning(f"Некорректный формат тикера для {symbol}")
+            return None
+        
+        price = float(ticker.get('last', 0))
+        
+        with cache_lock:
+            prices_cache["data"][symbol] = price
+            prices_cache["last_update"] = time.time()
+        
+        # Сохраняем в базу данных
+        db_manager.save_price_data(
+            symbol=symbol.upper(),
+            price=price,
+            volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
+            high=float(ticker.get('high', 0)) if ticker.get('high') else None,
+            low=float(ticker.get('low', 0)) if ticker.get('low') else None
+        )
+        
+        return price
+    except Exception as e:
+        logging.error(f"Ошибка получения цены для {symbol}: {e}")
+        return None
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_orderbook(symbol):
+    """Получение книги ордеров для указанной пары"""
+    global orderbook_cache
+    
+    with cache_lock:
+        if (symbol in orderbook_cache["data"] and 
+            symbol in orderbook_cache["last_update"] and 
+            time.time() - orderbook_cache["last_update"][symbol] < orderbook_cache["cache_duration"]):
+            return orderbook_cache["data"][symbol]
+    
+    try:
+        path = f"/public/markets/{symbol}/order-book"
+        url = BASE_URL + path
+        response = scraper.get(url, timeout=30)
+        response.raise_for_status()
+        orderbook = response.json()
+        
+        if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+            logging.warning(f"Пустая книга ордеров для {symbol}")
+            return None
+        
+        with cache_lock:
+            orderbook_cache["data"][symbol] = orderbook
+            orderbook_cache["last_update"][symbol] = time.time()
+        
+        return orderbook
+    except Exception as e:
+        logging.error(f"Ошибка получения книги ордеров для {symbol}: {e}")
+        return None
+
+def calculate_volatility(orderbook):
+    """Расчет волатильности на основе книги ордеров"""
+    if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+        logging.warning("Недостаточно данных для расчета волатильности")
+        return 0
+    
+    try:
+        best_bid = float(orderbook['bids'][0][0])
+        best_ask = float(orderbook['asks'][0][0])
+        spread = (best_ask - best_bid) / best_bid
+        
+        # Анализируем глубину книги ордеров
+        bid_depth = sum(float(bid[1]) for bid in orderbook['bids'][:5])
+        ask_depth = sum(float(ask[1]) for ask in orderbook['asks'][:5])
+        depth_ratio = min(bid_depth, ask_depth) / max(bid_depth, ask_depth) if max(bid_depth, ask_depth) > 0 else 0
+        
+        # Комбинированный показатель волатильности
+        volatility = spread * (1 - depth_ratio)
+        return volatility
+    except Exception as e:
+        logging.error(f"Ошибка при расчете волатильности: {e}")
+        return 0
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_market_data(symbol):
+    """Получает полные рыночные данные для указанной пары"""
+    try:
+        # Получаем текущую цену
+        current_price = get_ticker_price(symbol)
+        if not current_price:
+            logging.warning(f"Не удалось получить цену для {symbol}")
+            return None
+        
+        # Получаем книгу ордеров
+        orderbook = get_orderbook(symbol)
+        if not orderbook:
+            logging.warning(f"Не удалось получить книгу ордеров для {symbol}")
+            return None
+        
+        # Рассчитываем метрики
+        volatility = calculate_volatility(orderbook)
+        
+        # Рассчитываем глубину
+        bid_depth = sum(float(bid[1]) for bid in orderbook.get('bids', [])[:10])
+        ask_depth = sum(float(ask[1]) for ask in orderbook.get('asks', [])[:10])
+        
+        # Рассчитываем спред
+        best_bid = float(orderbook['bids'][0][0]) if orderbook['bids'] else 0
+        best_ask = float(orderbook['asks'][0][0]) if orderbook['asks'] else 0
+        spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
+        
+        # Получаем объем торгов (из тикера)
+        path = f"/public/markets/{symbol}/tickers"
+        url = BASE_URL + path
+        response = scraper.get(url, timeout=30)
+        response.raise_for_status()
+        ticker = response.json()
+        volume_24h = float(ticker.get('vol', 0))
+        
+        market_data = MarketData(
+            symbol=symbol.upper(),
+            current_price=current_price,
+            volatility=volatility,
+            volume_24h=volume_24h,
+            bid_depth=bid_depth,
+            ask_depth=ask_depth,
+            spread=spread
+        )
+        
+        # Валидируем рыночные условия
+        order_validator.validate_market_conditions(market_data)
+        
+        return market_data
+    except Exception as e:
+        logging.error(f"Ошибка при получении рыночных данных для {symbol}: {e}")
+        return None
+
+def prioritize_sales(balances_dict):
+    """Сортирует валюты по приоритету продажи"""
+    priority_scores = []
+    
+    for currency, balance in balances_dict.items():
+        try:
+            if balance <= 0:
+                continue
+            
+            # Определяем символ торговой пары
+            market_symbol = f"{currency.lower()}usdt"
+            
+            # Получаем рыночные данные
+            market_data = get_market_data(market_symbol)
+            if not market_data:
+                continue
+            
+            # Рассчитываем стоимость в USD
+            usd_value = balance * market_data.current_price
+            
+            # Пропускаем, если стоимость ниже минимальной
+            if usd_value < MIN_POSITION_VALUE_USD:
+                continue
+            
+            # Рассчитываем приоритетный балл
+            weight_value = 0.4
+            weight_liquidity = 0.3
+            weight_volatility = 0.2
+            weight_spread = 0.1
+            
+            # Нормализуем показатели (0-1)
+            value_score = min(usd_value / 1000, 1.0)
+            liquidity_score = min(market_data.bid_depth / 10000, 1.0)
+            volatility_score = 1 - min(market_data.volatility * 100, 1.0)
+            spread_score = 1 - min(market_data.spread * 100, 1.0)
+            
+            # Итоговый балл
+            priority_score = (
+                weight_value * value_score +
+                weight_liquidity * liquidity_score +
+                weight_volatility * volatility_score +
+                weight_spread * spread_score
+            )
+            
+            priority_scores.append(PriorityScore(
+                currency=currency,
+                balance=balance,
+                usd_value=usd_value,
+                priority_score=priority_score,
+                market_data=market_data
+            ))
+            
+        except Exception as e:
+            logging.error(f"Ошибка при расчете приоритета для {currency}: {e}")
+            continue
+    
+    # Сортируем по убыванию приоритета
+    priority_scores.sort(key=lambda x: x.priority_score, reverse=True)
+    
+    return priority_scores
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_ai_trading_decision(currency, balance, market_data):
+    """Получение решения о торговле от ИИ для конкретной валюты"""
+    if not cerebras_client:
+        return None
+    
+    estimated_tokens = 2000
+    if not cerebras_limiter.can_make_request(estimated_tokens):
+        logging.warning("Достигнут лимит Cerebras API. Используется стандартная стратегия.")
+        return None
+    
+    try:
+        # Валидация входных данных
+        if balance <= 0 or not market_data:
+            logging.warning(f"Некорректные данные для ИИ: balance={balance}, market_data={market_data}")
+            return None
+        
+        # Определяем размер позиции в USD
+        usd_value = balance * market_data.current_price
+        
+        # Выбираем базовую стратегию на основе размера позиции
+        if usd_value < 50:
+            base_strategy = "market"
+        elif usd_value < 500:
+            base_strategy = "limit"
+        else:
+            base_strategy = "twap"
+        
+        # Формируем контекст для ИИ
+        context = f"""
+        Ты - торговый ИИ-ассистент для криптовалютной биржи SafeTrade. Твоя задача - проанализировать текущие рыночные условия и предложить оптимальную стратегию для продажи {balance} {currency} за USDT.
+        
+        Текущие рыночные данные:
+        - Баланс {currency}: {balance}
+        - Стоимость в USD: ${usd_value:.2f}
+        - Текущая цена: {market_data.current_price}
+        - Волатильность рынка: {market_data.volatility:.4f}
+        - Объем торгов за 24 часа: {market_data.volume_24h}
+        - Глубина книги ордеров (покупка): {market_data.bid_depth}
+        - Глубина книги ордеров (продажа): {market_data.ask_depth}
+        - Спред: {market_data.spread:.4f}
+        
+        Рекомендуемая базовая стратегия: {base_strategy}
+        
+        Доступные стратегии:
+        1. market - немедленное исполнение по рыночной цене
+        2. limit - исполнение по указанной цене или лучше
+        3. twap - разделение на части через равные промежутки времени
+        4. iceberg - отображение только части ордера
+        5. adaptive - динамический выбор на основе рыночных условий
+        
+        Ответь в формате JSON:
+        {{
+            "strategy": "market|limit|twap|iceberg|adaptive",
+            "parameters": {{
+                "price": 0.0,
+                "duration_minutes": 60,
+                "chunks": 6,
+                "visible_amount": 0.1,
+                "max_attempts": 20
+            }},
+            "reasoning": "Обоснование выбора стратегии",
+            "confidence": 0.85
+        }}
+        """
+        
+        # Отправляем запрос к ИИ
+        response = cerebras_client.chat.completions.create(
+            messages=[{"role": "user", "content": context}],
+            model=CEREBRAS_MODEL,
+            max_completion_tokens=4000,
+        )
+        
+        # Парсим ответ
+        ai_response = response.choices[0].message.content
+        
+        # Ищем JSON в ответе
+        try:
+            start_idx = ai_response.find('{')
+            end_idx = ai_response.rfind('}') + 1
+            if start_idx != -1 and end_idx != -1:
+                json_str = ai_response[start_idx:end_idx]
+                decision = json.loads(json_str)
+                
+                # Создаем объект решения
+                trading_decision = TradingDecision(
+                    strategy=SellStrategy(decision.get("strategy", "market")),
+                    parameters=decision.get("parameters", {}),
+                    reasoning=decision.get("reasoning", ""),
+                    confidence=decision.get("confidence", 0.5)
+                )
+                
+                # Сохраняем решение ИИ
+                db_manager.save_ai_decision(
+                    decision_type="trading_strategy",
+                    decision_data=decision,
+                    market_data=market_data.to_dict(),
+                    reasoning=trading_decision.reasoning,
+                    confidence=trading_decision.confidence
+                )
+                
+                # Обновляем использование rate limiter
+                input_tokens = len(context) // 4
+                output_tokens = len(ai_response) // 4
+                cerebras_limiter.record_usage(input_tokens + output_tokens)
+                
+                return trading_decision
+            else:
+                logging.error(f"Не удалось найти JSON в ответе ИИ: {ai_response}")
+                return None
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.error(f"Ошибка парсинга JSON из ответа ИИ: {e}")
+            return None
+    except Exception as e:
+        logging.error(f"Ошибка при получении решения от ИИ: {e}")
+        return None
+
+def execute_trading_strategy(priority_score: PriorityScore, ai_decision: TradingDecision = None):
+    """Исполняет торговую стратегию для конкретной валюты"""
+    try:
+        market_symbol = f"{priority_score.currency.lower()}usdt"
+        amount = priority_score.balance
+        
+        # Валидируем параметры
+        order_validator.validate_order_params(market_symbol, amount)
+        
+        if ai_decision and ai_decision.strategy:
+            strategy = ai_decision.strategy
+            parameters = ai_decision.parameters
+        else:
+            # Используем стандартную логику выбора стратегии
+            if priority_score.usd_value < 50:
+                strategy = SellStrategy.MARKET
+                parameters = {}
+            elif priority_score.usd_value < 500:
+                strategy = SellStrategy.LIMIT
+                # Устанавливаем цену чуть ниже текущей рыночной
+                parameters = {"price": priority_score.market_data.current_price * 0.999}
+            else:
+                strategy = SellStrategy.TWAP
+                parameters = {"duration_minutes": 60, "chunks": 6}
+        
+        logging.info(f"Исполняем стратегию {strategy.value} для {priority_score.currency}")
+        
+        # Исполняем выбранную стратегию
+        if strategy == SellStrategy.MARKET:
+            return execute_market_sell(market_symbol, amount)
+        elif strategy == SellStrategy.LIMIT:
+            price = parameters.get("price", priority_score.market_data.current_price * 0.999)
+            return execute_limit_sell(market_symbol, amount, price)
+        elif strategy == SellStrategy.TWAP:
+            duration = parameters.get("duration_minutes", 60)
+            chunks = parameters.get("chunks", 6)
+            return execute_twap_sell(market_symbol, amount, duration, chunks)
+        elif strategy == SellStrategy.ICEBERG:
+            visible_ratio = parameters.get("visible_amount", 0.1)
+            max_attempts = parameters.get("max_attempts", 20)
+            return execute_iceberg_sell(market_symbol, amount, visible_ratio, max_attempts)
+        elif strategy == SellStrategy.ADAPTIVE:
+            return execute_adaptive_sell(market_symbol, amount)
+        
+        return False
+    except Exception as e:
+        logging.error(f"Ошибка при исполнении стратегии для {priority_score.currency}: {e}")
+        return False
+
+def execute_market_sell(market_symbol, amount):
+    """Исполнение рыночной продажи"""
+    try:
+        result = create_sell_order_safetrade(market_symbol, amount, "market")
+        return "✅" in result
+    except Exception as e:
+        logging.error(f"Ошибка рыночной продажи {market_symbol}: {e}")
+        return False
+
+def execute_limit_sell(market_symbol, amount, price):
+    """Исполнение лимитной продажи"""
+    try:
+        result = create_sell_order_safetrade(market_symbol, amount, "limit", price)
+        return "✅" in result
+    except Exception as e:
+        logging.error(f"Ошибка лимитной продажи {market_symbol}: {e}")
+        return False
+
+def execute_twap_sell(market_symbol, total_amount, duration_minutes=60, chunks=6):
+    """Исполнение TWAP продажи"""
+    if total_amount <= 0 or chunks <= 0:
+        logging.warning("Некорректные параметры для TWAP")
+        return False
+    
+    chunk_amount = total_amount / chunks
+    interval_seconds = (duration_minutes * 60) / chunks
+    successful_chunks = 0
+    
+    for i in range(chunks):
+        try:
+            # Получаем текущую цену
+            current_price = get_ticker_price(market_symbol)
+            if not current_price:
+                continue
+            
+            # Размещаем лимитный ордер чуть выше текущей цены
+            limit_price = current_price * 1.001
+            result = create_sell_order_safetrade(market_symbol, chunk_amount, "limit", limit_price)
+            
+            if "✅" in result:
+                successful_chunks += 1
+                order_id = extract_order_id_from_result(result)
+                if order_id:
+                    # Отслеживаем исполнение ордера
+                    threading.Thread(target=track_order_execution, args=(order_id, 300)).start()
+            
+            # Ждем до следующего интервала
+            if i < chunks - 1:
+                time.sleep(interval_seconds)
+        except Exception as e:
+            logging.error(f"Ошибка в TWAP исполнении чанка {i + 1}: {e}")
+    
+    return successful_chunks > 0
+
+def execute_iceberg_sell(market_symbol, total_amount, visible_ratio=0.1, max_attempts=20):
+    """Исполнение Iceberg продажи"""
+    if total_amount <= 0 or visible_ratio <= 0 or max_attempts <= 0:
+        logging.warning("Некорректные параметры для Iceberg")
+        return False
+    
+    remaining = total_amount
+    attempts = 0
+    successful_orders = 0
+    
+    while remaining > 0 and attempts < max_attempts:
+        try:
+            # Определяем размер видимой части
+            current_visible = min(visible_ratio * total_amount, remaining)
+            
+            # Получаем лучшую цену покупки из книги ордеров
+            orderbook = get_orderbook(market_symbol)
+            if not orderbook or not orderbook.get('bids'):
+                attempts += 1
+                time.sleep(5)
+                continue
+            
+            best_bid = float(orderbook['bids'][0][0])
+            
+            # Размещаем лимитный ордер
+            result = create_sell_order_safetrade(market_symbol, current_visible, "limit", best_bid)
+            
+            if "✅" in result:
+                successful_orders += 1
+                remaining -= current_visible
+                order_id = extract_order_id_from_result(result)
+                if order_id:
+                    threading.Thread(target=track_order_execution, args=(order_id, 60)).start()
+            
+            attempts += 1
+            time.sleep(5)
+        except Exception as e:
+            logging.error(f"Ошибка в Iceberg исполнении: {e}")
+            attempts += 1
+    
+    return successful_orders > 0
+
+def execute_adaptive_sell(market_symbol, total_amount):
+    """Адаптивная продажа на основе книги ордеров"""
+    if total_amount <= 0:
+        logging.warning("Некорректный amount для adaptive")
+        return False
+    
+    try:
+        orderbook = get_orderbook(market_symbol)
+        if not orderbook or not orderbook.get('bids'):
+            logging.warning(f"Пустая книга ордеров для {market_symbol}")
+            return False
+        
+        # Анализируем ликвидность на разных уровнях
+        bids = orderbook.get('bids', [])
+        price_levels = {}
+        for bid in bids[:CONFIG['trading']['strategies']['adaptive']['max_price_levels']]:
+            price = float(bid[0])
+            amount = float(bid[1])
+            price_levels[price] = price_levels.get(price, 0) + amount
+        
+        # Сортируем по цене (от высокой к низкой)
+        sorted_prices = sorted(price_levels.keys(), reverse=True)
+        
+        # Размещаем ордера на разных уровнях
+        remaining = total_amount
+        placed_orders = 0
+        liquidity_ratio = CONFIG['trading']['strategies']['adaptive']['liquidity_ratio']
+        
+        for price in sorted_prices:
+            if remaining <= 0:
+                break
+                
+            liquidity_at_price = price_levels[price]
+            order_size = min(remaining, liquidity_at_price * liquidity_ratio)
+            
+            if order_size > 0:
+                result = create_sell_order_safetrade(market_symbol, order_size, "limit", price)
+                if "✅" in result:
+                    placed_orders += 1
+                    remaining -= order_size
+                    order_id = extract_order_id_from_result(result)
+                    if order_id:
+                        threading.Thread(target=track_order_execution, args=(order_id, 600)).start()
+        
+        # Если остались неразмещенные средства, используем рыночный ордер
+        if remaining > 0:
+            result = create_sell_order_safetrade(market_symbol, remaining, "market")
+            if "✅" in result:
+                placed_orders += 1
+        
+        return placed_orders > 0
+    except Exception as e:
+        logging.error(f"Ошибка в adaptive продаже {market_symbol}: {e}")
+        return False
+
+def extract_order_id_from_result(result_text):
+    """Извлекает ID ордера из результата создания ордера"""
+    try:
+        if "ID ордера:" in result_text:
+            return result_text.split('ID ордера: ')[-1].split('\n')[0].strip('`')
+    except:
+        pass
+    return None
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
+    """Создает ордер на продажу и возвращает отформатированный результат"""
+    try:
+        # Валидация параметров
+        order_validator.validate_order_params(market_symbol, amount, order_type, price)
+        
+        path = "/trade/market/orders"
+        url = BASE_URL + path
+        
+        # Определяем валюты из символа
+        base_currency = market_symbol.replace('usdt', '').upper()
+        
+        payload = {
+            "market": market_symbol,
+            "side": "sell",
+            "type": order_type,
+            "amount": str(amount)
+        }
+        
+        if order_type == "limit" and price:
+            payload["price"] = str(price)
+        
         headers = get_auth_headers()
-        response = scraper.post(url, headers=headers, json=payload)
+        response = scraper.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         order_details = response.json()
+        
         order_id = order_details.get('id')
         order_amount = order_details.get('amount', amount)
-
+        
         # Сохраняем данные об ордере в локальную базу
-        save_order_data(
+        db_manager.save_order_data(
             order_id=order_id,
             timestamp=datetime.now().isoformat(),
             symbol=order_details.get('market', 'N/A'),
             side=order_details.get('side', 'N/A'),
-            type=order_details.get('type', 'N/A'),
+            order_type=order_details.get('type', 'N/A'),
             amount=float(order_amount),
             price=float(order_details.get('price', 0)) if order_details.get('price') else None,
             total=float(order_details.get('total', 0)) if order_details.get('total') else None,
             status=order_details.get('state', 'N/A')
         )
-
+        
         if order_id:
             threading.Thread(target=track_order, args=(order_id,)).start()
-
+        
         return (
             f"✅ *Успешно размещен ордер на продажу!*\n\n"
             f"*Биржа:* SafeTrade\n"
             f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
             f"*Тип:* `{order_details.get('type', 'N/A').capitalize()}`\n"
             f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
-            f"*Заявленный объем:* `{order_amount} {CURRENCY_TO_SELL}`\n"
+            f"*Заявленный объем:* `{order_amount} {base_currency}`\n"
             f"*ID ордера:* `{order_id}`"
         )
     except Exception as e:
         error_message = f"❌ Ошибка при создании ордера на продажу на SafeTrade: {e}"
         if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: `{e.response.text}`"
+            try:
+                error_details = e.response.text
+                error_message += f"\nОтвет сервера: `{error_details}`"
+            except:
+                pass
+        logging.error(error_message)
         return error_message
 
-
-def get_order_info(order_id):
-    """Получает информацию о конкретном ордере."""
-    path = f"/trade/market/orders/{order_id}"
-    url = BASE_URL + path
-    try:
-        headers = get_auth_headers()
-        response = scraper.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка при получении информации об ордере {order_id}: {e}")
-        return None
-
-
-def get_order_trades(order_id):
-    """Получает сделки по конкретному ордеру, фильтруя общую историю сделок."""
-    path = "/trade/market/trades"
-    url = BASE_URL + path
-    try:
-        headers = get_auth_headers()
-        params = {"order_id": str(order_id)}
-        response = scraper.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка при получении сделок по ордеру {order_id}: {e}")
-        return []
-
-
-def get_order_history(limit=10):
-    """Получает историю ордеров с биржи."""
-    path = "/trade/market/orders"
-    url = BASE_URL + path
-    try:
-        headers = get_auth_headers()
-        params = {"market": MARKET_SYMBOL, "limit": limit, "state": "done"}
-        response = scraper.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка при получении истории ордеров: {e}")
-        return []
-
-
-def get_ticker_price():
-    """Получает текущую цену QTC/USDT"""
-    path = f"/trade/market/tickers/{MARKET_SYMBOL}"
-    url = BASE_URL + path
-    try:
-        response = scraper.get(url)
-        response.raise_for_status()
-        ticker = response.json()
-        price = float(ticker.get('last', 0))
-
-        # Сохраняем данные о цене в локальную базу
-        save_price_data(
-            symbol=MARKET_SYMBOL.upper(),
-            price=price,
-            volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
-            high=float(ticker.get('high', 0)) if ticker.get('high') else None,
-            low=float(ticker.get('low', 0)) if ticker.get('low') else None
-        )
-
-        return price
-    except Exception as e:
-        print(f"Ошибка получения цены: {e}")
-        return None
-
-
-def get_orderbook():
-    """Получение книги ордеров"""
-    path = f"/trade/market/orderbook/{MARKET_SYMBOL}"
-    url = BASE_URL + path
-    try:
-        response = scraper.get(url)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка получения книги ордеров: {e}")
-        return None
-
-
-def get_recent_trades(limit=50):
-    """Получение недавних сделок"""
-    path = f"/trade/market/trades"
-    url = BASE_URL + path
-    try:
-        params = {"market": MARKET_SYMBOL, "limit": limit}
-        response = scraper.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Ошибка получения недавних сделок: {e}")
-        return None
-
-
-def calculate_volatility(orderbook):
-    """Расчет волатильности на основе книги ордеров"""
-    if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-        return 0
-
-    try:
-        best_bid = float(orderbook['bids'][0][0])
-        best_ask = float(orderbook['asks'][0][0])
-        spread = (best_ask - best_bid) / best_bid
-
-        # Анализируем глубину книги ордеров
-        bid_depth = sum(float(bid[1]) for bid in orderbook['bids'][:5])
-        ask_depth = sum(float(ask[1]) for ask in orderbook['asks'][:5])
-        depth_ratio = min(bid_depth, ask_depth) / max(bid_depth, ask_depth) if max(bid_depth, ask_depth) > 0 else 0
-
-        # Комбинированный показатель волатильности
-        volatility = spread * (1 - depth_ratio)
-        return volatility
-    except Exception as e:
-        print(f"Ошибка при расчете волатильности: {e}")
-        return 0
-
-
-def calculate_optimal_order_size(balance, orderbook):
-    """Расчет оптимального размера ордера на основе ликвидности"""
-    if not orderbook or not orderbook.get('bids'):
-        return balance
-
-    try:
-        # Берем не более 5% от ликвидности на лучших 5 уровнях
-        total_liquidity = sum(float(bid[1]) for bid in orderbook['bids'][:5])
-        optimal_size = min(balance, total_liquidity * 0.05)
-        return optimal_size
-    except Exception as e:
-        print(f"Ошибка при расчете оптимального размера ордера: {e}")
-        return balance
-
-
-def track_order(order_id):
-    """Отслеживает статус ордера и уведомляет о его исполнении."""
-    max_attempts = 30
-    check_interval = 10
-    for _ in range(max_attempts):
-        time.sleep(check_interval)
-        order_info = get_order_info(order_id)
-        if not order_info:
-            continue
-        if order_info.get('state') == 'done':
-            trades = get_order_trades(order_id)
-            if trades:
-                total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
-                total_sum = sum(float(trade.get('total', 0)) for trade in trades)
-                avg_price = total_sum / total_amount if total_amount > 0 else 0
-                executed_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                # Обновляем статус ордера в локальной базе данных
-                try:
-                    conn = sqlite3.connect('trading_analytics.db')
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                    UPDATE order_history
-                    SET status = ?, total = ?
-                    WHERE order_id = ?
-                    ''', ('done', total_sum, order_id))
-                    conn.commit()
-                    conn.close()
-                except Exception as e:
-                    print(f"Ошибка при обновлении статуса ордера: {e}")
-
-                # Записываем данные о продаже в Supabase
-                if supabase:
-                    insert_sale_record(order_id, total_amount, total_sum, avg_price, executed_time)
-
-                message = (
-                    f"✅ *Ордер исполнен!*\n\n"
-                    f"*ID ордера:* `{order_id}`\n"
-                    f"*Пара:* `{MARKET_SYMBOL.upper()}`\n"
-                    f"*Продано:* `{total_amount:.8f} {CURRENCY_TO_SELL}`\n"
-                    f"*Получено:* `{total_sum:.8f} {CURRENCY_TO_BUY}`\n"
-                    f"*Средняя цена:* `{avg_price:.8f} {CURRENCY_TO_BUY}`\n"
-                    f"*Время исполнения:* `{executed_time}`"
-                )
-                try:
-                    bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-                except Exception as e:
-                    print(f"Ошибка отправки уведомления: {e}")
-                return
-        elif order_info.get('state') == 'cancel':
-            # Обновляем статус ордера в локальной базе данных
-            try:
-                conn = sqlite3.connect('trading_analytics.db')
-                cursor = conn.cursor()
-                cursor.execute('''
-                UPDATE order_history
-                SET status = ?
-                WHERE order_id = ?
-                ''', ('cancel', order_id))
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                print(f"Ошибка при обновлении статуса ордера: {e}")
-            return
-    print(f"Прекращено отслеживание ордера {order_id} после {max_attempts} попыток")
-
-
-# --- Функции для работы с ИИ ---
-def check_cerebras_limits():
-    """Проверка лимитов Cerebras API"""
-    # В реальном приложении здесь должна быть проверка текущего использования API
-    # Для упрощения всегда возвращаем True
-    return True
-
-
-def get_ai_trading_decision(qtc_balance, market_data):
-    """Получение решения о торговле от ИИ"""
-    if not cerebras_client:
-        return None
-
-    if not check_cerebras_limits():
-        print("[WARNING] Достигнут лимит Cerebras API. Используется стандартная стратегия.")
-        return None
-
-    try:
-        # Формируем контекст для ИИ
-        context = f"""
-        Ты - торговый ИИ-ассистент для криптовалютной биржи SafeTrade. Твоя задача - проанализировать текущие рыночные условия и предложить оптимальную стратегию для продажи {qtc_balance} {CURRENCY_TO_SELL} за {CURRENCY_TO_BUY}.
-
-        Текущие рыночные данные:
-        - Баланс {CURRENCY_TO_SELL}: {qtc_balance}
-        - Текущая цена: {market_data.get('current_price', 'N/A')}
-        - Волатильность рынка: {market_data.get('volatility', 'N/A')}
-        - Объем торгов за последние 24 часа: {market_data.get('volume_24h', 'N/A')}
-        - История цен за последние 24 часа: {market_data.get('price_history', 'N/A')}
-        - Глубина книги ордеров (покупка): {market_data.get('bid_depth', 'N/A')}
-        - Глубина книги ордеров (продажа): {market_data.get('ask_depth', 'N/A')}
-        - Недавние сделки: {market_data.get('recent_trades', 'N/A')}
-
-        Доступные стратегии:
-        1. Рыночный ордер (Market) - немедленное исполнение по текущей рыночной цене
-        2. Лимитный ордер (Limit) - исполнение по указанной цене или лучше
-        3. TWAP (Time-Weighted Average Price) - разделение ордера на части и исполнение через равные промежутки времени
-        4. Iceberg (Айсберг) - отображение только небольшой части ордера, пока он исполняется
-
-        Проанализируй рыночные условия и предложи лучшую стратегию для продажи {CURRENCY_TO_SELL}. В ответе укажи:
-        1. Выбранную стратегию
-        2. Параметры стратегии (если применимо)
-        3. Обоснование выбора
-
-        Ответ предоставь в формате JSON:
-        {{
-            "strategy": "market|limit|twap|iceberg",
-            "parameters": {{
-                "price": 0.0,  // для лимитного ордера
-                "duration_minutes": 60,  // для TWAP
-                "chunks": 6,  // для TWAP
-                "visible_amount": 0.1,  // для Iceberg
-                "max_attempts": 20  // для Iceberg
-            }},
-            "reasoning": "Обоснование выбора стратегии"
-        }}
-        """
-
-        # Отправляем запрос к ИИ
-        response = cerebras_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": context,
-                }
-            ],
-            model=CEREBRAS_MODEL,
-            max_completion_tokens=4000,  # Увеличиваем лимит для получения полного ответа
-        )
-
-        # Парсим ответ
-        ai_response = response.choices[0].message.content
-
-        # Ищем JSON в ответе
-        try:
-            # Пытаемся найти JSON в ответе
-            start_idx = ai_response.find('{')
-            end_idx = ai_response.rfind('}') + 1
-
-            if start_idx != -1 and end_idx != -1:
-                json_str = ai_response[start_idx:end_idx]
-                decision = json.loads(json_str)
-
-                # Сохраняем решение ИИ
-                save_ai_decision(
-                    decision_type="trading_strategy",
-                    decision_data=decision,
-                    market_data=market_data,
-                    reasoning=decision.get("reasoning", "")
-                )
-
-                return decision
-            else:
-                print(f"[ERROR] Не удалось найти JSON в ответе ИИ: {ai_response}")
-                return None
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] Ошибка парсинга JSON из ответа ИИ: {e}")
-            print(f"Ответ ИИ: {ai_response}")
-            return None
-
-    except Exception as e:
-        print(f"[ERROR] Ошибка при получении решения от ИИ: {e}")
-        return None
-
-
-def execute_twap_sell(total_amount, duration_minutes=60, chunks=6):
-    """Исполнение TWAP продажи"""
-    chunk_amount = total_amount / chunks
-    interval_seconds = (duration_minutes * 60) / chunks
-
-    sold_amount = 0
-    total_received = 0
-
-    for i in range(chunks):
-        try:
-            # Получаем текущую цену
-            current_price = get_ticker_price()
-            if current_price:
-                # Размещаем лимитный ордер чуть выше текущей цены
-                limit_price = current_price * 1.001  # 0.1% выше рынка
-
-                order_result = create_sell_order_safetrade(chunk_amount, "limit", limit_price)
-                if order_result:
-                    order_id = order_result.split('ID ордера: ')[-1].split('\n')[0]
-                    if order_id:
-                        # Отслеживаем исполнение ордера
-                        trades = track_order_execution(order_id, timeout=300)  # 5 минут
-                        if trades:
-                            executed_amount = sum(float(t.get('amount', 0)) for t in trades)
-                            executed_sum = sum(float(t.get('total', 0)) for t in trades)
-                            sold_amount += executed_amount
-                            total_received += executed_sum
-
-                            # Если ордер исполнился не полностью, добавляем остаток к следующему
-                            remaining = chunk_amount - executed_amount
-                            if remaining > 0 and i < chunks - 1:
-                                chunk_amount += remaining
-
-            # Ждем до следующего интервала
-            if i < chunks - 1:
-                time.sleep(interval_seconds)
-
-        except Exception as e:
-            print(f"Ошибка в TWAP исполнении чанка {i + 1}: {e}")
-
-    return sold_amount, total_received
-
-
-def execute_iceberg_sell(total_amount, visible_amount=0.1, max_attempts=20):
-    """Исполнение Iceberg продажи"""
-    remaining = total_amount
-    sold_amount = 0
-    total_received = 0
-    attempts = 0
-
-    while remaining > 0 and attempts < max_attempts:
-        try:
-            # Определяем размер видимой части
-            current_visible = min(visible_amount, remaining)
-
-            # Получаем текущую цену и лучшую цену в книге ордеров
-            orderbook = get_orderbook()
-            best_bid = float(orderbook['bids'][0][0]) if orderbook['bids'] else 0
-
-            if best_bid:
-                # Размещаем лимитный ордер на лучшей цене покупки
-                order_result = create_sell_order_safetrade(current_visible, "limit", best_bid)
-
-                if order_result:
-                    order_id = order_result.split('ID ордера: ')[-1].split('\n')[0]
-                    if order_id:
-                        # Отслеживаем исполнение
-                        trades = track_order_execution(order_id, timeout=60)
-                        if trades:
-                            executed_amount = sum(float(t.get('amount', 0)) for t in trades)
-                            executed_sum = sum(float(t.get('total', 0)) for t in trades)
-                            sold_amount += executed_amount
-                            total_received += executed_sum
-                            remaining -= executed_amount
-
-            attempts += 1
-            # Небольшая задержка между попытками
-            time.sleep(5)
-
-        except Exception as e:
-            print(f"Ошибка в Iceberg исполнении: {e}")
-            attempts += 1
-
-    return sold_amount, total_received
-
-
-def execute_adaptive_sell(total_amount):
-    """Адаптивная продажа на основе книги ордеров"""
-    orderbook = get_orderbook()
-    if not orderbook:
-        return None, None
-
-    # Анализируем ликвидность на разных уровнях
-    bids = orderbook.get('bids', [])
-    if not bids:
-        return None, None
-
-    # Группируем заявки по ценовым уровням
-    price_levels = {}
-    for bid in bids:
-        price = float(bid[0])
-        amount = float(bid[1])
-        price_levels[price] = price_levels.get(price, 0) + amount
-
-    # Сортируем по цене (от высокой к низкой)
-    sorted_prices = sorted(price_levels.keys(), reverse=True)
-
-    # Определяем оптимальные уровни для размещения
-    remaining = total_amount
-    placed_orders = []
-
-    for price in sorted_prices:
-        if remaining <= 0:
-            break
-
-        liquidity_at_price = price_levels[price]
-        order_size = min(remaining, liquidity_at_price * 0.1)  # Берем не более 10% ликвидности на уровне
-
-        if order_size > 0:
-            # Размещаем ордер
-            order_result = create_sell_order_safetrade(order_size, "limit", price)
-            if order_result:
-                order_id = order_result.split('ID ордера: ')[-1].split('\n')[0]
-                placed_orders.append((order_id, order_size, price))
-                remaining -= order_size
-
-    # Если остались неразмещенные средства, используем рыночный ордер
-    if remaining > 0:
-        market_result = create_sell_order_safetrade(remaining, "market")
-        if market_result:
-            order_id = market_result.split('ID ордера: ')[-1].split('\n')[0]
-            placed_orders.append((order_id, remaining, 'market'))
-
-    # Отслеживаем исполнение всех ордеров
-    sold_amount = 0
-    total_received = 0
-
-    for order_id, amount, price in placed_orders:
-        if price == 'market':
-            # Для рыночного ордера ждем исполнения
-            trades = track_order_execution(order_id, timeout=300)
-            if trades:
-                executed_amount = sum(float(t.get('amount', 0)) for t in trades)
-                executed_sum = sum(float(t.get('total', 0)) for t in trades)
-                sold_amount += executed_amount
-                total_received += executed_sum
-        else:
-            # Для лимитных ордеров ждем или отменяем через время
-            trades = track_order_execution(order_id, timeout=600)  # 10 минут
-            if trades:
-                executed_amount = sum(float(t.get('amount', 0)) for t in trades)
-                executed_sum = sum(float(t.get('total', 0)) for t in trades)
-                sold_amount += executed_amount
-                total_received += executed_sum
-            else:
-                # Отменяем неисполненный ордер
-                cancel_order(order_id)
-
-    return sold_amount, total_received
-
-
-def track_order_execution(order_id, timeout=60):
-    """Отслеживает исполнение ордера и возвращает сделки"""
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def track_order_execution(order_id, timeout=300):
+    """Отслеживает исполнение ордера и возвращает trades"""
     start_time = time.time()
-
     while time.time() - start_time < timeout:
-        order_info = get_order_info(order_id)
-        if not order_info:
-            continue
-
-        if order_info.get('state') == 'done':
-            return get_order_trades(order_id)
-        elif order_info.get('state') == 'cancel':
-            return None
-
-        time.sleep(2)
-
+        try:
+            path = f"/trade/market/orders/{order_id}/trades"
+            url = BASE_URL + path
+            response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+            response.raise_for_status()
+            trades = response.json()
+            if trades:
+                # Обновляем статус ордера в базе данных
+                total_executed = sum(float(t.get('total', 0)) for t in trades)
+                db_manager.save_order_data(
+                    order_id=order_id,
+                    timestamp=datetime.now().isoformat(),
+                    symbol="N/A",
+                    side="sell",
+                    order_type="N/A",
+                    amount=0,
+                    price=0,
+                    total=total_executed,
+                    status="filled"
+                )
+                return trades
+            time.sleep(10)
+        except Exception as e:
+            logging.error(f"Ошибка отслеживания ордера {order_id}: {e}")
+            time.sleep(10)
+    
+    logging.warning(f"Таймаут отслеживания ордера {order_id}")
     return None
 
-
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def cancel_order(order_id):
     """Отменяет ордер"""
-    path = f"/trade/market/orders/{order_id}"
-    url = BASE_URL + path
     try:
-        headers = get_auth_headers()
-        response = scraper.delete(url, headers=headers)
+        path = f"/trade/market/orders/{order_id}/cancel"
+        url = BASE_URL + path
+        response = scraper.post(url, headers=get_auth_headers(), timeout=30)
         response.raise_for_status()
+        logging.info(f"Ордер {order_id} отменён")
+        
+        # Обновляем статус в базе данных
+        db_manager.save_order_data(
+            order_id=order_id,
+            timestamp=datetime.now().isoformat(),
+            symbol="N/A",
+            side="sell",
+            order_type="N/A",
+            amount=0,
+            price=0,
+            total=0,
+            status="cancelled"
+        )
         return True
     except Exception as e:
-        print(f"Ошибка при отмене ордера {order_id}: {e}")
+        logging.error(f"Ошибка отмены ордера {order_id}: {e}")
         return False
 
+def track_order(order_id):
+    """Фоновая функция для отслеживания ордера"""
+    logging.info(f"Отслеживание ордера {order_id} начато")
+    try:
+        trades = track_order_execution(order_id, timeout=3600)  # 1 час
+        if trades:
+            logging.info(f"Ордер {order_id} исполнен: {len(trades)} сделок")
+        else:
+            logging.warning(f"Ордер {order_id} не исполнен в течение часа")
+            # Попробуем отменить неисполненный ордер
+            cancel_order(order_id)
+    except Exception as e:
+        logging.error(f"Ошибка отслеживания ордера {order_id}: {e}")
 
-def auto_sell_qtc_advanced():
-    """Улучшенная авто-продажа с использованием ИИ для выбора стратегии"""
-    auto_sell_enabled = os.getenv("AUTO_SELL_ENABLED", "true").lower() == "true"
-    if not auto_sell_enabled:
-        return
+def cancel_all_active_orders():
+    """Отменяет все активные ордера при завершении работы"""
+    try:
+        path = "/trade/market/orders"
+        url = BASE_URL + path
+        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        response.raise_for_status()
+        orders = response.json()
+        
+        for order in orders:
+            if order.get('state') in ['wait', 'pending']:
+                cancel_order(order.get('id'))
+        
+        logging.info("Все активные ордера отменены")
+    except Exception as e:
+        logging.error(f"Ошибка отмены активных ордеров: {e}")
 
-    while True:
-        try:
-            # Получаем баланс
-            headers = get_auth_headers()
-            response = scraper.get(BASE_URL + "/trade/account/balances/spot", headers=headers)
-            response.raise_for_status()
-            balances = response.json()
+def save_cache_state():
+    """Сохраняет состояние кэша при завершении работы"""
+    try:
+        cache_state = {
+            "markets": markets_cache,
+            "prices": prices_cache,
+            "timestamp": time.time()
+        }
+        with open("cache_state.json", "w") as f:
+            json.dump(cache_state, f, default=str)
+        logging.info("Состояние кэша сохранено")
+    except Exception as e:
+        logging.error(f"Ошибка сохранения состояния кэша: {e}")
 
-            qtc_balance = 0.0
-            if isinstance(balances, list):
-                for balance in balances:
-                    if balance.get("currency", "").upper() == CURRENCY_TO_SELL:
-                        qtc_balance = float(balance.get("balance", 0))
-                        break
+def load_cache_state():
+    """Загружает состояние кэша при запуске"""
+    try:
+        cache_file = Path("cache_state.json")
+        if cache_file.exists():
+            with open(cache_file, "r") as f:
+                cache_state = json.load(f)
+            
+            # Проверяем, не устарел ли кэш
+            if time.time() - cache_state.get("timestamp", 0) < 3600:  # 1 час
+                global markets_cache, prices_cache
+                markets_cache.update(cache_state.get("markets", {}))
+                prices_cache.update(cache_state.get("prices", {}))
+                logging.info("Состояние кэша загружено")
+    except Exception as e:
+        logging.error(f"Ошибка загрузки состояния кэша: {e}")
 
-            if qtc_balance <= 0:
-                time.sleep(3600)
-                continue
+def invalidate_cache():
+    """Инвалидация кэша после продажи"""
+    with cache_lock:
+        prices_cache["data"] = {}
+        prices_cache["last_update"] = None
+        orderbook_cache["data"] = {}
+        orderbook_cache["last_update"] = {}
+        logging.info("Кэш инвалидирован после операций")
 
-            # Собираем рыночные данные для анализа
-            market_data = {
-                "current_price": get_ticker_price(),
-                "volatility": None,
-                "volume_24h": None,
-                "price_history": None,
-                "bid_depth": None,
-                "ask_depth": None,
-                "recent_trades": None
-            }
-
-            # Получаем дополнительные данные
-            orderbook = get_orderbook()
-            if orderbook:
-                market_data["volatility"] = calculate_volatility(orderbook)
-
-                # Рассчитываем глубину книги ордеров
-                market_data["bid_depth"] = sum(float(bid[1]) for bid in orderbook.get('bids', [])[:10])
-                market_data["ask_depth"] = sum(float(ask[1]) for ask in orderbook.get('asks', [])[:10])
-
-            # Получаем историю цен
-            price_history = get_price_history(MARKET_SYMBOL.upper(), limit=24)
-            if price_history:
-                market_data["price_history"] = price_history
-
-            # Получаем недавние сделки
-            recent_trades = get_recent_trades(limit=20)
-            if recent_trades:
-                market_data["recent_trades"] = recent_trades
-
-            # Получаем решение от ИИ
-            ai_decision = get_ai_trading_decision(qtc_balance, market_data)
-
-            if ai_decision:
-                strategy = ai_decision.get("strategy")
-                parameters = ai_decision.get("parameters", {})
-
-                # Выполняем выбранную стратегию
-                if strategy == "market":
-                    sell_result = create_sell_order_safetrade(qtc_balance, "market")
-                    bot.send_message(ADMIN_CHAT_ID,
-                                     f"🔄 *Автоматическая продажа (Market, рекомендация ИИ)*\n\n{sell_result}",
-                                     parse_mode='Markdown')
-
-                elif strategy == "limit":
-                    price = parameters.get("price", 0)
-                    if price > 0:
-                        sell_result = create_sell_order_safetrade(qtc_balance, "limit", price)
-                        bot.send_message(ADMIN_CHAT_ID,
-                                         f"🔄 *Автоматическая продажа (Limit, рекомендация ИИ)*\n\n{sell_result}",
-                                         parse_mode='Markdown')
+def auto_sell_all_altcoins():
+    """
+    Главная функция автоматической продажи всех альткоинов
+    """
+    logging.info("Запуск автоматической продажи всех альткоинов")
+    
+    try:
+        with sales_sem:  # Ограничиваем количество одновременных продаж
+            # Получаем все продаваемые балансы
+            balances = get_sellable_balances()
+            if not balances:
+                logging.info("Нет балансов для продажи")
+                return {"success": False, "message": "Нет балансов для продажи"}
+            
+            # Определяем приоритет продаж
+            priority_scores = prioritize_sales(balances)
+            if not priority_scores:
+                logging.info("Нет валют, подходящих для продажи")
+                return {"success": False, "message": "Нет валют, подходящих для продажи"}
+            
+            total_processed = 0
+            successful_sales = 0
+            failed_sales = 0
+            
+            # Обрабатываем каждую валюту по приоритету
+            for score in priority_scores:
+                try:
+                    logging.info(f"Обработка {score.currency}: {score.balance} (${score.usd_value:.2f})")
+                    
+                    # Получаем решение ИИ для оптимальной стратегии
+                    ai_decision = None
+                    if cerebras_client:
+                        ai_decision = get_ai_trading_decision(
+                            score.currency, 
+                            score.balance, 
+                            score.market_data
+                        )
+                    
+                    # Исполняем торговую стратегию
+                    success = execute_trading_strategy(score, ai_decision)
+                    
+                    if success:
+                        successful_sales += 1
+                        logging.info(f"✅ Успешно продан {score.currency}")
                     else:
-                        # Если цена не указана, используем рыночный ордер
-                        sell_result = create_sell_order_safetrade(qtc_balance, "market")
-                        bot.send_message(ADMIN_CHAT_ID,
-                                         f"🔄 *Автоматическая продажа (Market, fallback из-за отсутствия цены)*\n\n{sell_result}",
-                                         parse_mode='Markdown')
-
-                elif strategy == "twap":
-                    duration = parameters.get("duration_minutes", 60)
-                    chunks = parameters.get("chunks", 6)
-                    sold_amount, total_received = execute_twap_sell(qtc_balance, duration, chunks)
-                    avg_price = total_received / sold_amount if sold_amount > 0 else 0
-                    message = (
-                        f"🔄 *Автоматическая продажа (TWAP, рекомендация ИИ)*\n\n"
-                        f"*Продано:* `{sold_amount:.8f} QTC`\n"
-                        f"*Получено:* `{total_received:.8f} USDT`\n"
-                        f"*Средняя цена:* `{avg_price:.8f} USDT`\n"
-                        f"*Длительность:* `{duration} минут`\n"
-                        f"*Количество частей:* `{chunks}`"
+                        failed_sales += 1
+                        logging.warning(f"❌ Не удалось продать {score.currency}")
+                    
+                    total_processed += 1
+                    
+                    # Небольшая задержка между продажами
+                    time.sleep(2)
+                    
+                except Exception as e:
+                    logging.error(f"Ошибка при продаже {score.currency}: {e}")
+                    failed_sales += 1
+                    total_processed += 1
+            
+            # Инвалидируем кэш после всех операций
+            invalidate_cache()
+            
+            # Отправляем отчет администратору
+            if ADMIN_CHAT_ID:
+                report = (
+                    f"🤖 **Отчет по автопродажам**\n\n"
+                    f"📊 **Статистика:**\n"
+                    f"• Обработано валют: {total_processed}\n"
+                    f"• Успешных продаж: {successful_sales}\n"
+                    f"• Неудачных попыток: {failed_sales}\n"
+                    f"• Время выполнения: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"💰 **Обработанные валюты:**\n"
+                )
+                
+                for score in priority_scores[:5]:  # Показываем только топ-5
+                    status = "✅" if score.currency in [s.currency for s in priority_scores] else "❌"
+                    report += f"{status} {score.currency}: ${score.usd_value:.2f}\n"
+                
+                try:
+                    bot.send_message(
+                        ADMIN_CHAT_ID, 
+                        report, 
+                        parse_mode='Markdown'
                     )
-                    bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
+                except Exception as e:
+                    logging.error(f"Ошибка отправки отчета админу: {e}")
+            
+            return {
+                "success": True,
+                "total_processed": total_processed,
+                "successful_sales": successful_sales,
+                "failed_sales": failed_sales,
+                "message": f"Обработано {total_processed} валют, успешно продано {successful_sales}"
+            }
+    
+    except Exception as e:
+        error_msg = f"Критическая ошибка в автопродаже: {e}"
+        logging.error(error_msg)
+        
+        # Отправляем уведомление об ошибке администратору
+        if ADMIN_CHAT_ID:
+            try:
+                bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"🚨 **Ошибка автопродажи**\n\n{error_msg}",
+                    parse_mode='Markdown'
+                )
+            except:
+                pass
+        
+        return {"success": False, "message": error_msg}
 
-                elif strategy == "iceberg":
-                    visible_amount = parameters.get("visible_amount", 0.1)
-                    max_attempts = parameters.get("max_attempts", 20)
-                    sold_amount, total_received = execute_iceberg_sell(qtc_balance, visible_amount, max_attempts)
-                    avg_price = total_received / sold_amount if sold_amount > 0 else 0
-                    message = (
-                        f"🔄 *Автоматическая продажа (Iceberg, рекомендация ИИ)*\n\n"
-                        f"*Продано:* `{sold_amount:.8f} QTC`\n"
-                        f"*Получено:* `{total_received:.8f} USDT`\n"
-                        f"*Средняя цена:* `{avg_price:.8f} USDT`\n"
-                        f"*Видимая часть:* `{visible_amount} QTC`\n"
-                        f"*Максимум попыток:* `{max_attempts}`"
-                    )
-                    bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
+def start_auto_sell_scheduler():
+    """Запускает планировщик автоматических продаж"""
+    def scheduler():
+        while True:
+            try:
+                time.sleep(AUTO_SELL_INTERVAL)
+                auto_sell_all_altcoins()
+            except Exception as e:
+                logging.error(f"Ошибка в планировщике автопродаж: {e}")
+                time.sleep(60)  # Ждем минуту при ошибке
+    
+    scheduler_thread = threading.Thread(target=scheduler, daemon=True)
+    scheduler_thread.start()
+    logging.info(f"Планировщик автопродаж запущен с интервалом {AUTO_SELL_INTERVAL} секунд")
 
-                else:
-                    # Неизвестная стратегия, используем рыночный ордер
-                    sell_result = create_sell_order_safetrade(qtc_balance, "market")
-                    bot.send_message(ADMIN_CHAT_ID,
-                                     f"🔄 *Автоматическая продажа (Market, неизвестная стратегия ИИ)*\n\n{sell_result}",
-                                     parse_mode='Markdown')
-
-            else:
-                # Если ИИ недоступен или не смог принять решение, используем адаптивную стратегию
-                sold_amount, total_received = execute_adaptive_sell(qtc_balance)
-                if sold_amount and total_received:
-                    avg_price = total_received / sold_amount
-                    message = (
-                        f"🔄 *Автоматическая продажа (Adaptive, без ИИ)*\n\n"
-                        f"*Продано:* `{sold_amount:.8f} QTC`\n"
-                        f"*Получено:* `{total_received:.8f} USDT`\n"
-                        f"*Средняя цена:* `{avg_price:.8f} USDT`"
-                    )
-                    bot.send_message(ADMIN_CHAT_ID, message, parse_mode='Markdown')
-                else:
-                    # Если адаптивная стратегия не сработала, используем простой рыночный ордер
-                    sell_result = create_sell_order_safetrade(qtc_balance, "market")
-                    bot.send_message(ADMIN_CHAT_ID, f"🔄 *Автоматическая продажа (Market, fallback)*\n\n{sell_result}",
-                                     parse_mode='Markdown')
-
-        except Exception as e:
-            error_message = f"❌ Ошибка при автоматической продаже: {e}"
-            print(error_message)
-            bot.send_message(ADMIN_CHAT_ID, error_message, parse_mode='Markdown')
-
-        # Ждем до следующей проверки
-        time.sleep(3600)
-
-
-# --- Обработчики команд Telegram ---
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    """Обработчик команды /start с подробным описанием."""
+# --- TELEGRAM BOT HANDLERS ---
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    """Приветственное сообщение"""
     welcome_text = """
-👋 *Добро пожаловать в бот для управления биржей SafeTrade с поддержкой ИИ!*
-Этот бот позволяет вам взаимодействовать с вашим аккаунтом на бирже SafeTrade прямо из Telegram.
-Искусственный интеллект анализирует рыночные условия и выбирает оптимальную стратегию для продажи QTC.
-*Доступные команды:*
-✅ `/start` - Показать это приветственное сообщение и список команд.
-💰 `/balance` - Показать все ваши ненулевые балансы на спотовом кошельке.
-📉 `/sell_qtc` - Создать рыночный ордер на продажу *всего доступного* баланса QTC за USDT.
-📊 `/history` - Показать историю ваших ордеров.
-🤖 `/ai_status` - Показать статус ИИ и последние решения.
-❤️ `/donate` - Поддержать автора бота.
-Используйте кнопки внизу для быстрого доступа к командам.
+🤖 **Добро пожаловать в SafeTrade Trading Bot!**
+Этот бот поможет вам автоматизировать торговлю криптовалютами на бирже SafeTrade.
+**Доступные команды:**
+• `/balance` - показать текущие балансы
+• `/sell_all` - продать все альткоины за USDT
+• `/history` - показать историю сделок
+• `/ai_status` - статус ИИ-помощника
+• `/markets` - показать доступные торговые пары
+• `/config` - показать текущую конфигурацию
+• `/health` - проверить состояние бота
+• `/restart` - перезапустить бота (админ)
+• `/donate` - поддержать разработчика
+• `/help` - показать эту справку
+**Возможности:**
+🎯 Умная приоритизация продаж
+🧠 ИИ-помощник для выбора стратегий
+📊 Несколько торговых стратегий
+🔄 Автоматическая торговля
+📈 Детальная аналитика
+Для начала работы используйте команду `/balance`
 """
-    bot.send_message(
-        message.chat.id,
-        text=welcome_text,
-        parse_mode='Markdown',
+    
+    bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=menu_markup)
+
+@bot.message_handler(commands=['health'])
+def health_check(message):
+    """Проверка состояния бота"""
+    if str(message.chat.id) == ADMIN_CHAT_ID:
+        network_status = "✅ OK" if check_network_connectivity() else "❌ Error"
+        bot.reply_to(message, f"🤖 Бот: Активен\n🌐 Сеть: {network_status}")
+    else:
+        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+
+@bot.message_handler(commands=['restart'])
+def restart_bot(message):
+    """Перезапуск бота"""
+    if str(message.chat.id) == ADMIN_CHAT_ID:
+        bot.reply_to(message, "🔄 Перезапуск бота...")
+        logging.info("Перезапуск бота по команде администратора")
+        # Используем graceful shutdown
+        shutdown_handler(signal.SIGINT, None)
+    else:
+        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+
+@bot.message_handler(commands=['balance'])
+def show_balance(message):
+    """Показывает текущие балансы"""
+    try:
+        balances = get_sellable_balances()
+        if not balances:
+            bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
+            return
+        
+        priority_scores = prioritize_sales(balances)
+        
+        response = "💰 **Ваши балансы:**\n\n"
+        total_usd = 0
+        
+        for i, score in enumerate(priority_scores, 1):
+            total_usd += score.usd_value
+            response += (
+                f"{i}. **{score.currency}**\n"
+                f"   • Количество: `{score.balance:.8f}`\n"
+                f"   • Цена: `${score.market_data.current_price:.6f}`\n"
+                f"   • Стоимость: `${score.usd_value:.2f}`\n"
+                f"   • Приоритет: `{score.priority_score:.3f}`\n"
+                f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
+            )
+        
+        response += f"💵 **Общая стоимость: ${total_usd:.2f}`**"
+        
+        bot.reply_to(message, response, parse_mode='Markdown')
+    
+    except Exception as e:
+        logging.error(f"Ошибка в show_balance: {e}")
+        bot.reply_to(message, f"❌ Ошибка получения балансов: {e}")
+
+@bot.message_handler(commands=['sell_all'])
+def sell_all_altcoins(message):
+    """Продает все альткоины"""
+    try:
+        # Проверяем права доступа
+        if str(message.chat.id) != ADMIN_CHAT_ID:
+            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+            return
+        
+        bot.reply_to(message, "🔄 Начинаю автоматическую продажу всех альткоинов...")
+        
+        # Запускаем продажу в отдельном потоке
+        def sell_thread():
+            result = auto_sell_all_altcoins()
+            
+            if result["success"]:
+                response = (
+                    f"✅ **Автопродажа завершена!**\n\n"
+                    f"📊 **Результаты:**\n"
+                    f"• Обработано: {result['total_processed']}\n"
+                    f"• Успешно: {result['successful_sales']}\n"
+                    f"• Ошибки: {result['failed_sales']}\n"
+                )
+            else:
+                response = f"❌ **Ошибка автопродажи:**\n{result['message']}"
+            
+            bot.send_message(message.chat.id, response, parse_mode='Markdown')
+        
+        threading.Thread(target=sell_thread).start()
+    
+    except Exception as e:
+        logging.error(f"Ошибка в sell_all_altcoins: {e}")
+        bot.reply_to(message, f"❌ Ошибка запуска автопродажи: {e}")
+
+@bot.message_handler(commands=['history'])
+def show_history(message):
+    """Показывает историю последних сделок"""
+    try:
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
+            FROM order_history
+            ORDER BY created_at DESC
+            LIMIT 10
+            ''')
+            
+            orders = cursor.fetchall()
+            
+            if not orders:
+                bot.reply_to(message, "📊 История сделок пуста")
+                return
+            
+            response = "📈 **История последних сделок:**\n\n"
+            
+            for order in orders:
+                order_id, timestamp, symbol, side, order_type, amount, price, total, status = order
+                dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
+                
+                status_emoji = {
+                    'filled': '✅',
+                    'cancelled': '❌',
+                    'pending': '⏳',
+                    'partial': '🔄'
+                }.get(status.lower(), '❓')
+                
+                response += (
+                    f"{status_emoji} **{symbol.upper()}**\n"
+                    f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
+                    f"   • Количество: `{amount:.8f}`\n"
+                    f"   • Цена: `{price:.6f}` (если есть)\n"
+                    f"   • Итого: `{total:.6f}` USDT\n"
+                    f"   • Время: `{dt}`\n"
+                    f"   • ID: `{order_id[:8]}...`\n\n"
+                )
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
+    
+    except Exception as e:
+        logging.error(f"Ошибка в show_history: {e}")
+        bot.reply_to(message, f"❌ Ошибка получения истории: {e}")
+
+@bot.message_handler(commands=['ai_status'])
+def show_ai_status(message):
+    """Показывает статус ИИ-помощника"""
+    try:
+        if not cerebras_client:
+            bot.reply_to(message, "❌ ИИ-помощник не настроен (отсутствует CEREBRAS_API_KEY)")
+            return
+        
+        # Получаем последние решения ИИ
+        recent_decisions = db_manager.get_recent_ai_decisions(5)
+        
+        response = "🧠 **Статус ИИ-помощника:**\n\n"
+        response += f"✅ **Состояние:** Активен\n"
+        response += f"🎯 **Модель:** {CEREBRAS_MODEL}\n\n"
+        
+        if recent_decisions:
+            response += "📋 **Последние решения:**\n\n"
+            
+            for decision in recent_decisions:
+                dt = datetime.fromisoformat(decision['timestamp']).strftime('%d.%m %H:%M')
+                confidence = decision['confidence'] or 0
+                confidence_emoji = "🟢" if confidence > 0.7 else "🟡" if confidence > 0.4 else "🔴"
+                
+                try:
+                    decision_data = json.loads(decision['decision_data'])
+                    strategy = decision_data.get('strategy', 'unknown')
+                except:
+                    strategy = 'unknown'
+                
+                response += (
+                    f"{confidence_emoji} `{dt}` - **{strategy.upper()}**\n"
+                    f"   • Уверенность: `{confidence:.1%}`\n"
+                    f"   • Обоснование: _{decision['reasoning'][:50]}..._\n\n"
+                )
+        else:
+            response += "📋 **Решения:** Пока нет данных\n"
+        
+        bot.reply_to(message, response, parse_mode='Markdown')
+    
+    except Exception as e:
+        logging.error(f"Ошибка в show_ai_status: {e}")
+        bot.reply_to(message, f"❌ Ошибка получения статуса ИИ: {e}")
+
+@bot.message_handler(commands=['markets'])
+def show_markets(message):
+    """Показывает доступные торговые пары"""
+    try:
+        markets = get_all_markets()
+        
+        if not markets:
+            bot.reply_to(message, "❌ Не удалось получить список торговых пар")
+            return
+        
+        response = f"📊 **Доступные торговые пары ({len(markets)}):**\n\n"
+        
+        # Показываем первые 20 пар
+        for i, market in enumerate(markets[:20], 1):
+            symbol = market.get('id', 'N/A').upper()
+            base = market.get('base_unit', 'N/A').upper()
+            quote = market.get('quote_unit', 'N/A').upper()
+            
+            response += f"{i}. **{symbol}** ({base}/{quote})\n"
+        
+        if len(markets) > 20:
+            response += f"\n... и еще {len(markets) - 20} пар"
+        
+        bot.reply_to(message, response, parse_mode='Markdown')
+    
+    except Exception as e:
+        logging.error(f"Ошибка в show_markets: {e}")
+        bot.reply_to(message, f"❌ Ошибка получения торговых пар: {e}")
+
+@bot.message_handler(commands=['config'])
+def show_config(message):
+    """Показывает текущую конфигурацию"""
+    try:
+        response = "⚙️ **Текущая конфигурация:**\n\n"
+        
+        response += "**🔧 Торговые настройки:**\n"
+        response += f"• Исключенные валюты: `{', '.join(EXCLUDED_CURRENCIES)}`\n"
+        response += f"• Мин. стоимость позиции: `${MIN_POSITION_VALUE_USD}`\n"
+        response += f"• Макс. одновременных продаж: `{MAX_CONCURRENT_SALES}`\n"
+        response += f"• Интервал автопродаж: `{AUTO_SELL_INTERVAL}` сек\n\n"
+        
+        response += "**🧠 ИИ настройки:**\n"
+        response += f"• Модель: `{CEREBRAS_MODEL}`\n"
+        response += f"• Статус: `{'Активен' if cerebras_client else 'Отключен'}`\n\n"
+        
+        response += "**💾 Кэширование:**\n"
+        response += f"• Торговые пары: `{CONFIG['cache']['markets_duration']}` сек\n"
+        response += f"• Цены: `{CONFIG['cache']['prices_duration']}` сек\n"
+        response += f"• Книга ордеров: `{CONFIG['cache']['orderbook_duration']}` сек\n\n"
+        
+        response += "**📊 Стратегии:**\n"
+        for strategy, params in CONFIG['trading']['strategies'].items():
+            response += f"• {strategy.upper()}: `{params}`\n"
+        
+        bot.reply_to(message, response, parse_mode='Markdown')
+    
+    except Exception as e:
+        logging.error(f"Ошибка в show_config: {e}")
+        bot.reply_to(message, f"❌ Ошибка получения конфигурации: {e}")
+
+@bot.message_handler(commands=['donate'])
+def show_donate(message):
+    """Показывает информацию о пожертвованиях"""
+    donate_text = f"""
+💖 **Поддержите разработчика!**
+Если этот бот помог вам в торговле, вы можете поддержать разработку:
+🔗 **Ссылка для пожертвований:**
+{DONATE_URL}
+Ваша поддержка поможет:
+• 🔧 Улучшить функционал бота
+• 🧠 Добавить новые ИИ-возможности  
+• 🐛 Быстрее исправлять ошибки
+• 📈 Разработать новые стратегии торговли
+**Спасибо за вашу поддержку! ❤️**
+"""
+    
+    bot.reply_to(message, donate_text, parse_mode='Markdown')
+
+# Обработчик всех остальных сообщений
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    """Обработчик всех остальных сообщений"""
+    bot.reply_to(
+        message, 
+        "❓ Неизвестная команда. Используйте /help для просмотра доступных команд.",
         reply_markup=menu_markup
     )
 
-
-@bot.message_handler(commands=['balance'])
-def handle_balance(message):
-    """Обработчик команды /balance."""
-    bot.send_message(message.chat.id, "🔍 Запрашиваю балансы с SafeTrade...")
-    balance_info = get_balances_safetrade()
-    bot.send_message(message.chat.id, balance_info, parse_mode='Markdown')
-
-
-@bot.message_handler(commands=['sell_qtc'])
-def handle_sell(message):
-    """Обработчик команды /sell_qtc."""
-    bot.send_message(message.chat.id, f"Ищу `{CURRENCY_TO_SELL}` на балансе для продажи...", parse_mode='Markdown')
+# --- ЗАПУСК БОТА ---
+def start_bot():
+    """Улучшенный запуск бота с проверками"""
+    # Проверяем сетевое подключение
+    if not check_network_connectivity():
+        logging.warning("Проблемы с сетью, настраиваем DNS...")
+        configure_dns()
+        time.sleep(10)  # Ждем применения настроек
+        
+        if not check_network_connectivity():
+            logging.error("Не удалось восстановить сетевое подключение")
+            # Пробуем webhook режим
+            if setup_webhook_mode():
+                logging.info("Переключились на webhook режим")
+                return
+            else:
+                logging.error("Webhook режим недоступен")
+                sys.exit(1)
+    
+    # Запускаем с retry механизмом
     try:
-        headers = get_auth_headers()
-        response = scraper.get(BASE_URL + "/trade/account/balances/spot", headers=headers)
-        response.raise_for_status()
-        balances = response.json()
-        qtc_balance = 0.0
-        if isinstance(balances, list):
-            for balance in balances:
-                if balance.get("currency", "").upper() == CURRENCY_TO_SELL:
-                    qtc_balance = float(balance.get("balance", 0))
-                    break
-        if qtc_balance > 0:
-            bot.send_message(message.chat.id,
-                             f"✅ Обнаружено `{qtc_balance}` {CURRENCY_TO_SELL}. Создаю ордер на продажу...",
-                             parse_mode='Markdown')
-            sell_result = create_sell_order_safetrade(qtc_balance)
-            bot.send_message(message.chat.id, sell_result, parse_mode='Markdown')
-        else:
-            bot.send_message(message.chat.id, f"Баланс `{CURRENCY_TO_SELL}` равен 0. Продавать нечего.",
-                             parse_mode='Markdown')
+        bot.infinity_polling_with_retry()
     except Exception as e:
-        error_message = f"❌ Произошла ошибка перед созданием ордера: {e}"
-        if hasattr(e, 'response') and e.response is not None:
-            error_message += f"\nОтвет сервера: {e.response.text}"
-        bot.send_message(message.chat.id, error_message)
+        logging.error(f"Критическая ошибка бота: {e}")
+        sys.exit(1)
 
-
-@bot.message_handler(commands=['history'])
-def handle_history(message):
-    """Обработчик команды /history с корректным отображением исполненных ордеров."""
-    bot.send_message(message.chat.id, "🔍 Запрашиваю историю ордеров с SafeTrade...")
-    orders = get_order_history(limit=10)
-    if orders and isinstance(orders, list) and len(orders) > 0:
-        history_text = "📊 *История ваших ордеров:*\n\n"
-        for order in orders:
-            order_id = order.get('id', 'N/A')
-            created_at = order.get('created_at', 'N/A')
+def main():
+    """Главная функция запуска"""
+    try:
+        logging.info("Запуск SafeTrade Trading Bot...")
+        
+        # Загружаем состояние кэша
+        load_cache_state()
+        
+        # Проверяем соединение с API
+        if not API_KEY or not API_SECRET:
+            logging.error("Отсутствуют API ключи SafeTrade")
+            return
+        
+        # Проверяем соединение с Telegram Bot
+        if not TELEGRAM_BOT_TOKEN:
+            logging.error("Отсутствует токен Telegram бота")
+            return
+        
+        # Запускаем планировщик автопродаж
+        if AUTO_SELL_INTERVAL > 0:
+            start_auto_sell_scheduler()
+        
+        # Отправляем уведомление о запуске
+        if ADMIN_CHAT_ID:
             try:
-                dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S.%fZ")
-                formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                formatted_time = created_at
-            amount_str = f"`{order.get('amount', 'N/A')}`"
-            price_str = f"`{order.get('price', 'N/A')}`"
-            total_str = f"`{order.get('total', 'N/A')}`"
-            if order.get('state') == 'done':
-                trades = get_order_trades(order_id)
-                if trades and isinstance(trades, list) and len(trades) > 0:
-                    total_amount = sum(float(trade.get('amount', 0)) for trade in trades)
-                    total_sum = sum(float(trade.get('total', 0)) for trade in trades)
-                    avg_price = total_sum / total_amount if total_amount > 0 else 0
-                    amount_str = f"`{total_amount:.8f}`"
-                    price_str = f"`{avg_price:.8f}` (средняя)"
-                    total_str = f"`{total_sum:.8f}`"
-            history_text += (
-                f"*ID ордера:* `{order_id}`\n"
-                f"*Пара:* `{order.get('market', 'N/A').upper()}`\n"
-                f"*Тип:* `{order.get('type', 'N/A').capitalize()}`\n"
-                f"*Сторона:* `{order.get('side', 'N/A').capitalize()}`\n"
-                f"*Объем:* {amount_str} {CURRENCY_TO_SELL}\n"
-                f"*Цена:* {price_str} {CURRENCY_TO_BUY}\n"
-                f"*Сумма:* {total_str} {CURRENCY_TO_BUY}\n"
-                f"*Статус:* `{order.get('state', 'N/A').capitalize()}`\n"
-                f"*Время создания:* `{formatted_time}`\n\n"
-            )
-        bot.send_message(message.chat.id, history_text, parse_mode='Markdown')
-    else:
-        bot.send_message(message.chat.id, "История ордеров пуста.")
+                bot.send_message(
+                    ADMIN_CHAT_ID,
+                    "🚀 **SafeTrade Trading Bot запущен!**\n\nВсе системы готовы к работе.",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logging.error(f"Ошибка отправки уведомления о запуске: {e}")
+        
+        logging.info("Бот успешно запущен и готов к работе")
+        
+        # Запускаем бота
+        start_bot()
+        
+    except KeyboardInterrupt:
+        logging.info("Получен сигнал прерывания")
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}")
+    finally:
+        logging.info("Завершение работы бота...")
+        # Сохраняем состояние при завершении
+        save_cache_state()
+        cancel_all_active_orders()
 
-
-@bot.message_handler(commands=['ai_status'])
-def handle_ai_status(message):
-    """Обработчик команды /ai_status."""
-    if not cerebras_client:
-        bot.send_message(message.chat.id, "❌ ИИ недоступен. Проверьте настройки API ключа Cerebras.")
-        return
-
-    # Получаем последние решения ИИ
-    recent_decisions = get_recent_ai_decisions(limit=5)
-
-    status_text = f"🤖 *Статус ИИ-ассистента*\n\n"
-    status_text += f"*Модель:* `{CEREBRAS_MODEL}`\n"
-    status_text += f"*Статус:* {'✅ Активен' if cerebras_client else '❌ Неактивен'}\n\n"
-
-    if recent_decisions:
-        status_text += "*Последние решения:*\n\n"
-        for decision in recent_decisions:
-            timestamp = decision.get('timestamp', 'N/A')
-            try:
-                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except:
-                formatted_time = timestamp
-
-            decision_type = decision.get('decision_type', 'N/A')
-            decision_data = decision.get('decision_data', {})
-            reasoning = decision.get('reasoning', 'N/A')
-
-            strategy = decision_data.get('strategy', 'N/A')
-            parameters = decision_data.get('parameters', {})
-
-            status_text += f"*Время:* `{formatted_time}`\n"
-            status_text += f"*Тип решения:* `{decision_type}`\n"
-            status_text += f"*Стратегия:* `{strategy}`\n"
-
-            if parameters:
-                params_str = ", ".join([f"{k}: `{v}`" for k, v in parameters.items()])
-                status_text += f"*Параметры:* {params_str}\n"
-
-            if reasoning and reasoning != 'N/A':
-                # Ограничиваем длину обоснования
-                short_reasoning = reasoning[:200] + "..." if len(reasoning) > 200 else reasoning
-                status_text += f"*Обоснование:* {short_reasoning}\n"
-
-            status_text += "\n"
-    else:
-        status_text += "Пока нет решений от ИИ.\n"
-
-    bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
-
-
-@bot.message_handler(commands=['donate'])
-def handle_donate(message):
-    """Обработчик команды /donate."""
-    donate_markup = types.InlineKeyboardMarkup()
-    donate_button = types.InlineKeyboardButton(text="Поддержать автора ❤️", url=DONATE_URL)
-    donate_markup.add(donate_button)
-    bot.send_message(
-        message.chat.id,
-        "Если вы хотите поддержать разработку этого бота, вы можете сделать пожертвование. Спасибо!",
-        reply_markup=donate_markup
-    )
-
-
-# --- Основной цикл бота ---
 if __name__ == "__main__":
-    if not all([API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN, ADMIN_CHAT_ID]):
-        print(
-            "[CRITICAL] Не все переменные окружения установлены! Проверьте SAFETRADE_API_KEY, SAFETRADE_API_SECRET, TELEGRAM_BOT_TOKEN и ADMIN_CHAT_ID в файле .env")
-    else:
-        print("Бот SafeTrade с поддержкой ИИ запущен...")
-        # Синхронизация отсутствующих записей при старте
-        if supabase:
-            print("🔄 Запускаю синхронизацию записей о продажах...")
-            sync_missing_sales()
-
-        # Запускаем поток для автоматической продажи QTC каждый час с использованием ИИ
-        auto_sell_thread = threading.Thread(target=auto_sell_qtc_advanced, daemon=True)
-        auto_sell_thread.start()
-        print("🔄 Запущен автоматический режим продажи QTC каждый час с использованием ИИ")
-
-        try:
-            start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ai_status = "с поддержкой ИИ" if cerebras_client else "без поддержки ИИ"
-            bot.send_message(
-                ADMIN_CHAT_ID,
-                f"✅ *Бот SafeTrade успешно запущен!*\n\n*Время запуска:* `{start_time}`\n*Режим:* {ai_status}\nОжидаю команды...\n\n🔄 *Автоматическая продажа QTC каждый час включена*",
-                parse_mode='Markdown'
-            )
-            print(f"Уведомление о запуске отправлено администратору (Chat ID: {ADMIN_CHAT_ID})")
-        except Exception as e:
-            print(f"[WARNING] Не удалось отправить уведомление о запуске администратору. Ошибка: {e}")
-
-        bot.infinity_polling()
+    main()
