@@ -1659,7 +1659,7 @@ if bot:
         
         bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=menu_markup)
 
-        @bot.message_handler(commands=['health'])
+    @bot.message_handler(commands=['health'])
     def health_check(message):
         """Проверка состояния бота"""
         if str(message.chat.id) == ADMIN_CHAT_ID:
@@ -1668,7 +1668,7 @@ if bot:
         else:
             bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
-        @bot.message_handler(commands=['restart'])
+    @bot.message_handler(commands=['restart'])
     def restart_bot(message):
         """Перезапуск бота"""
         if str(message.chat.id) == ADMIN_CHAT_ID:
@@ -1681,36 +1681,36 @@ if bot:
 
     @bot.message_handler(commands=['balance'])
     def show_balance(message):
-    """Показывает текущие балансы"""
-    try:
-        balances = get_sellable_balances()
-        if not balances:
-            bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
-            return
+        """Показывает текущие балансы"""
+        try:
+            balances = get_sellable_balances()
+            if not balances:
+                bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
+                return
+            
+            priority_scores = prioritize_sales(balances)
+            
+            response = "💰 **Ваши балансы:**\n\n"
+            total_usd = 0
+            
+            for i, score in enumerate(priority_scores, 1):
+                total_usd += score.usd_value
+                response += (
+                    f"{i}. **{score.currency}**\n"
+                    f"   • Количество: `{score.balance:.8f}`\n"
+                    f"   • Цена: `${score.market_data.current_price:.6f}`\n"
+                    f"   • Стоимость: `${score.usd_value:.2f}`\n"
+                    f"   • Приоритет: `{score.priority_score:.3f}`\n"
+                    f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
+                )
+            
+            response += f"💵 **Общая стоимость: ${total_usd:.2f}`**"
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
         
-        priority_scores = prioritize_sales(balances)
-        
-        response = "💰 **Ваши балансы:**\n\n"
-        total_usd = 0
-        
-        for i, score in enumerate(priority_scores, 1):
-            total_usd += score.usd_value
-            response += (
-                f"{i}. **{score.currency}**\n"
-                f"   • Количество: `{score.balance:.8f}`\n"
-                f"   • Цена: `${score.market_data.current_price:.6f}`\n"
-                f"   • Стоимость: `${score.usd_value:.2f}`\n"
-                f"   • Приоритет: `{score.priority_score:.3f}`\n"
-                f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
-            )
-        
-        response += f"💵 **Общая стоимость: ${total_usd:.2f}`**"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-    
-    except Exception as e:
-        logging.error(f"Ошибка в show_balance: {e}")
-        bot.reply_to(message, f"❌ Ошибка получения балансов: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка в show_balance: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения балансов: {e}")
 
 @bot.message_handler(commands=['sell_all'])
 def sell_all_altcoins(message):
