@@ -1712,195 +1712,193 @@ if bot:
             logging.error(f"Ошибка в show_balance: {e}")
             bot.reply_to(message, f"❌ Ошибка получения балансов: {e}")
 
-@bot.message_handler(commands=['sell_all'])
-def sell_all_altcoins(message):
-    """Продает все альткоины"""
-    try:
-        # Проверяем права доступа
-        if str(message.chat.id) != ADMIN_CHAT_ID:
-            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
-            return
-        
-        bot.reply_to(message, "🔄 Начинаю автоматическую продажу всех альткоинов...")
-        
-        # Запускаем продажу в отдельном потоке
-        def sell_thread():
-            result = auto_sell_all_altcoins()
-            
-            if result["success"]:
-                response = (
-                    f"✅ **Автопродажа завершена!**\n\n"
-                    f"📊 **Результаты:**\n"
-                    f"• Обработано: {result['total_processed']}\n"
-                    f"• Успешно: {result['successful_sales']}\n"
-                    f"• Ошибки: {result['failed_sales']}\n"
-                )
-            else:
-                response = f"❌ **Ошибка автопродажи:**\n{result['message']}"
-            
-            bot.send_message(message.chat.id, response, parse_mode='Markdown')
-        
-        threading.Thread(target=sell_thread).start()
-    
-    except Exception as e:
-        logging.error(f"Ошибка в sell_all_altcoins: {e}")
-        bot.reply_to(message, f"❌ Ошибка запуска автопродажи: {e}")
-
-@bot.message_handler(commands=['history'])
-def show_history(message):
-    """Показывает историю последних сделок"""
-    try:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-            SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
-            FROM safetrade_order_history
-            ORDER BY created_at DESC
-            LIMIT 10
-            ''')
-            
-            orders = cursor.fetchall()
-            
-            if not orders:
-                bot.reply_to(message, "📊 История сделок пуста")
+    @bot.message_handler(commands=['sell_all'])
+    def sell_all_altcoins(message):
+        """Продает все альткоины"""
+        try:
+            # Проверяем права доступа
+            if str(message.chat.id) != ADMIN_CHAT_ID:
+                bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
                 return
             
-            response = "📈 **История последних сделок:**\n\n"
+            bot.reply_to(message, "🔄 Начинаю автоматическую продажу всех альткоинов...")
             
-            for order in orders:
-                order_id, timestamp, symbol, side, order_type, amount, price, total, status = order
-                dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
+            # Запускаем продажу в отдельном потоке
+            def sell_thread():
+                result = auto_sell_all_altcoins()
                 
-                status_emoji = {
-                    'filled': '✅',
-                    'cancelled': '❌',
-                    'pending': '⏳',
-                    'partial': '🔄'
-                }.get(status.lower(), '❓')
+                if result["success"]:
+                    response = (
+                        f"✅ **Автопродажа завершена!**\n\n"
+                        f"📊 **Результаты:**\n"
+                        f"• Обработано: {result['total_processed']}\n"
+                        f"• Успешно: {result['successful_sales']}\n"
+                        f"• Ошибки: {result['failed_sales']}\n"
+                    )
+                else:
+                    response = f"❌ **Ошибка автопродажи:**\n{result['message']}"
                 
-                response += (
-                    f"{status_emoji} **{symbol.upper()}**\n"
-                    f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
-                    f"   • Количество: `{amount:.8f}`\n"
-                    f"   • Цена: `{price:.6f}` (если есть)\n"
-                    f"   • Итого: `{total:.6f}` USDT\n"
-                    f"   • Время: `{dt}`\n"
-                    f"   • ID: `{order_id[:8]}...`\n\n"
-                )
+                bot.send_message(message.chat.id, response, parse_mode='Markdown')
+            
+            threading.Thread(target=sell_thread).start()
+        
+        except Exception as e:
+            logging.error(f"Ошибка в sell_all_altcoins: {e}")
+            bot.reply_to(message, f"❌ Ошибка запуска автопродажи: {e}")
+
+    @bot.message_handler(commands=['history'])
+    def show_history(message):
+        """Показывает историю последних сделок"""
+        try:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
+                FROM safetrade_order_history
+                ORDER BY created_at DESC
+                LIMIT 10
+                ''')
+                
+                orders = cursor.fetchall()
+                
+                if not orders:
+                    bot.reply_to(message, "📊 История сделок пуста")
+                    return
+                
+                response = "📈 **История последних сделок:**\n\n"
+                
+                for order in orders:
+                    order_id, timestamp, symbol, side, order_type, amount, price, total, status = order
+                    dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
+                    
+                    status_emoji = {
+                        'filled': '✅',
+                        'cancelled': '❌',
+                        'pending': '⏳',
+                        'partial': '🔄'
+                    }.get(status.lower(), '❓')
+                    
+                    response += (
+                        f"{status_emoji} **{symbol.upper()}**\n"
+                        f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
+                        f"   • Количество: `{amount:.8f}`\n"
+                        f"   • Цена: `{price:.6f}` (если есть)\n"
+                        f"   • Итого: `{total:.6f}` USDT\n"
+                        f"   • Время: `{dt}`\n"
+                        f"   • ID: `{order_id[:8]}...`\n\n"
+                    )
+                
+                bot.reply_to(message, response, parse_mode='Markdown')
+        
+        except Exception as e:
+            logging.error(f"Ошибка в show_history: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения истории: {e}")
+
+    @bot.message_handler(commands=['ai_status'])
+    def show_ai_status(message):
+        """Показывает статус ИИ-помощника"""
+        try:
+            if not cerebras_client:
+                bot.reply_to(message, "❌ ИИ-помощник не настроен (отсутствует CEREBRAS_API_KEY)")
+                return
+            
+            # Получаем последние решения ИИ
+            recent_decisions = db_manager.get_recent_ai_decisions(5)
+            
+            response = "🧠 **Статус ИИ-помощника:**\n\n"
+            response += f"✅ **Состояние:** Активен\n"
+            
+            if recent_decisions:
+                response += "📋 **Последние решения:**\n\n"
+                
+                for decision in recent_decisions:
+                    dt = datetime.fromisoformat(decision['timestamp']).strftime('%d.%m %H:%M')
+                    confidence = decision['confidence'] or 0
+                    confidence_emoji = "🟢" if confidence > 0.7 else "🟡" if confidence > 0.4 else "🔴"
+                    
+                    try:
+                        decision_data = json.loads(decision['decision_data'])
+                        strategy = decision_data.get('strategy', 'unknown')
+                    except:
+                        strategy = 'unknown'
+                    
+                    response += (
+                        f"{confidence_emoji} `{dt}` - **{strategy.upper()}**\n"
+                        f"   • Уверенность: `{confidence:.1%}`\n"
+                        f"   • Обоснование: _{decision['reasoning'][:50]}..._\n\n"
+                    )
+            else:
+                response += "📋 **Решения:** Пока нет данных\n"
             
             bot.reply_to(message, response, parse_mode='Markdown')
-    
-    except Exception as e:
-        logging.error(f"Ошибка в show_history: {e}")
-        bot.reply_to(message, f"❌ Ошибка получения истории: {e}")
+        
+        except Exception as e:
+            logging.error(f"Ошибка в show_ai_status: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения статуса ИИ: {e}")
 
-@bot.message_handler(commands=['ai_status'])
-def show_ai_status(message):
-    """Показывает статус ИИ-помощника"""
-    try:
-        if not cerebras_client:
-            bot.reply_to(message, "❌ ИИ-помощник не настроен (отсутствует CEREBRAS_API_KEY)")
-            return
-        
-        # Получаем последние решения ИИ
-        recent_decisions = db_manager.get_recent_ai_decisions(5)
-        
-        response = "🧠 **Статус ИИ-помощника:**\n\n"
-        response += f"✅ **Состояние:** Активен\n"
-        response += f"🎯 **Модель:** {CEREBRAS_MODEL}\n\n"
-        
-        if recent_decisions:
-            response += "📋 **Последние решения:**\n\n"
+    @bot.message_handler(commands=['markets'])
+    def show_markets(message):
+        """Показывает доступные торговые пары"""
+        try:
+            markets = get_all_markets()
             
-            for decision in recent_decisions:
-                dt = datetime.fromisoformat(decision['timestamp']).strftime('%d.%m %H:%M')
-                confidence = decision['confidence'] or 0
-                confidence_emoji = "🟢" if confidence > 0.7 else "🟡" if confidence > 0.4 else "🔴"
-                
-                try:
-                    decision_data = json.loads(decision['decision_data'])
-                    strategy = decision_data.get('strategy', 'unknown')
-                except:
-                    strategy = 'unknown'
-                
-                response += (
-                    f"{confidence_emoji} `{dt}` - **{strategy.upper()}**\n"
-                    f"   • Уверенность: `{confidence:.1%}`\n"
-                    f"   • Обоснование: _{decision['reasoning'][:50]}..._\n\n"
-                )
-        else:
-            response += "📋 **Решения:** Пока нет данных\n"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-    
-    except Exception as e:
-        logging.error(f"Ошибка в show_ai_status: {e}")
-        bot.reply_to(message, f"❌ Ошибка получения статуса ИИ: {e}")
-
-@bot.message_handler(commands=['markets'])
-def show_markets(message):
-    """Показывает доступные торговые пары"""
-    try:
-        markets = get_all_markets()
-        
-        if not markets:
-            bot.reply_to(message, "❌ Не удалось получить список торговых пар")
-            return
-        
-        response = f"📊 **Доступные торговые пары ({len(markets)}):**\n\n"
-        
-        # Показываем первые 20 пар
-        for i, market in enumerate(markets[:20], 1):
-            symbol = market.get('id', 'N/A').upper()
-            base = market.get('base_unit', 'N/A').upper()
-            quote = market.get('quote_unit', 'N/A').upper()
+            if not markets:
+                bot.reply_to(message, "❌ Не удалось получить список торговых пар")
+                return
             
-            response += f"{i}. **{symbol}** ({base}/{quote})\n"
+            response = f"📊 **Доступные торговые пары ({len(markets)}):**\n\n"
+            
+            # Показываем первые 20 пар
+            for i, market in enumerate(markets[:20], 1):
+                symbol = market.get('id', 'N/A').upper()
+                base = market.get('base_unit', 'N/A').upper()
+                quote = market.get('quote_unit', 'N/A').upper()
+                
+                response += f"{i}. **{symbol}** ({base}/{quote})\n"
+            
+            if len(markets) > 20:
+                response += f"\n... и еще {len(markets) - 20} пар"
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
         
-        if len(markets) > 20:
-            response += f"\n... и еще {len(markets) - 20} пар"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-    
-    except Exception as e:
-        logging.error(f"Ошибка в show_markets: {e}")
-        bot.reply_to(message, f"❌ Ошибка получения торговых пар: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка в show_markets: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения торговых пар: {e}")
 
-@bot.message_handler(commands=['config'])
-def show_config(message):
-    """Показывает текущую конфигурацию"""
-    try:
-        response = "⚙️ **Текущая конфигурация:**\n\n"
+    @bot.message_handler(commands=['config'])
+    def show_config(message):
+        """Показывает текущую конфигурацию"""
+        try:
+            response = "⚙️ **Текущая конфигурация:**\n\n"
+            
+            response += "**🔧 Торговые настройки:**\n"
+            response += f"• Исключенные валюты: `{', '.join(EXCLUDED_CURRENCIES)}`\n"
+            response += f"• Мин. стоимость позиции: `${MIN_POSITION_VALUE_USD}`\n"
+            response += f"• Макс. одновременных продаж: `{MAX_CONCURRENT_SALES}`\n"
+            response += f"• Интервал автопродаж: `{AUTO_SELL_INTERVAL}` сек\n\n"
+            
+            response += "**🧠 ИИ настройки:**\n"
+            response += f"• Статус: `{'Активен' if cerebras_client else 'Отключен'}`\n\n"
+            
+            response += "**💾 Кэширование:**\n"
+            response += f"• Торговые пары: `{CONFIG['cache']['markets_duration']}` сек\n"
+            response += f"• Цены: `{CONFIG['cache']['prices_duration']}` сек\n"
+            response += f"• Книга ордеров: `{CONFIG['cache']['orderbook_duration']}` сек\n\n"
+            
+            response += "**📊 Стратегии:**\n"
+            for strategy, params in CONFIG['trading']['strategies'].items():
+                response += f"• {strategy.upper()}: `{params}`\n"
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
         
-        response += "**🔧 Торговые настройки:**\n"
-        response += f"• Исключенные валюты: `{', '.join(EXCLUDED_CURRENCIES)}`\n"
-        response += f"• Мин. стоимость позиции: `${MIN_POSITION_VALUE_USD}`\n"
-        response += f"• Макс. одновременных продаж: `{MAX_CONCURRENT_SALES}`\n"
-        response += f"• Интервал автопродаж: `{AUTO_SELL_INTERVAL}` сек\n\n"
-        
-        response += "**🧠 ИИ настройки:**\n"
-        response += f"• Модель: `{CEREBRAS_MODEL}`\n"
-        response += f"• Статус: `{'Активен' if cerebras_client else 'Отключен'}`\n\n"
-        
-        response += "**💾 Кэширование:**\n"
-        response += f"• Торговые пары: `{CONFIG['cache']['markets_duration']}` сек\n"
-        response += f"• Цены: `{CONFIG['cache']['prices_duration']}` сек\n"
-        response += f"• Книга ордеров: `{CONFIG['cache']['orderbook_duration']}` сек\n\n"
-        
-        response += "**📊 Стратегии:**\n"
-        for strategy, params in CONFIG['trading']['strategies'].items():
-            response += f"• {strategy.upper()}: `{params}`\n"
-        
-        bot.reply_to(message, response, parse_mode='Markdown')
-    
-    except Exception as e:
-        logging.error(f"Ошибка в show_config: {e}")
-        bot.reply_to(message, f"❌ Ошибка получения конфигурации: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка в show_config: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения конфигурации: {e}")
 
-@bot.message_handler(commands=['donate'])
-def show_donate(message):
-    """Показывает информацию о пожертвованиях"""
-    donate_text = f"""
+    @bot.message_handler(commands=['donate'])
+    def show_donate(message):
+        """Показывает информацию о пожертвованиях"""
+        donate_text = f"""
 💖 **Поддержите разработчика!**
 Если этот бот помог вам в торговле, вы можете поддержать разработку:
 🔗 **Ссылка для пожертвований:**
@@ -1912,20 +1910,20 @@ def show_donate(message):
 • 📈 Разработать новые стратегии торговли
 **Спасибо за вашу поддержку! ❤️**
 """
-    
-    bot.reply_to(message, donate_text, parse_mode='Markdown')
+        
+        bot.reply_to(message, donate_text, parse_mode='Markdown')
 
-# Обработчик всех остальных сообщений
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    """Обработчик всех остальных сообщений"""
-    bot.reply_to(
-        message, 
-        "❓ Неизвестная команда. Используйте /help для просмотра доступных команд.",
-        reply_markup=menu_markup
-    )
+    # Обработчик всех остальных сообщений
+    @bot.message_handler(func=lambda message: True)
+    def handle_all_messages(message):
+        """Обработчик всех остальных сообщений"""
+        bot.reply_to(
+            message, 
+            "❓ Неизвестная команда. Используйте /help для просмотра доступных команд.",
+            reply_markup=menu_markup
+        )
 
-# --- ЗАПУСК БОТА ---
+# Закрываем блок if bot:
 def start_bot():
     """Улучшенный запуск бота с проверками"""
     if not bot:
