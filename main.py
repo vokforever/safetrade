@@ -504,7 +504,8 @@ menu_markup.row('/balance', '/sell_all')
 menu_markup.row('/history', '/ai_status')
 menu_markup.row('/markets', '/config')
 menu_markup.row('/donate', '/help')
-menu_markup.row('/health', '/restart')
+menu_markup.row('/health', '/test_api')
+menu_markup.row('/restart')
 
 # --- WEBHOOK MODE AS FALLBACK ---
 def setup_webhook_mode():
@@ -591,6 +592,52 @@ class OrderValidator:
 order_validator = OrderValidator()
 
 # --- Функции для работы с API SafeTrade ---
+def test_api_endpoints():
+    """Тестирует различные API эндпоинты для поиска работающих"""
+    logging.info("🔍 Тестирование API эндпоинтов SafeTrade...")
+    
+    test_endpoints = [
+        "/trade/public/markets",
+        "/public/markets",
+        "/markets",
+        "/trade/markets",
+        "/trade/public/tickers/btcusdt",
+        "/public/markets/btcusdt/tickers",
+        "/tickers/btcusdt",
+        "/trade/tickers/btcusdt"
+    ]
+    
+    working_endpoints = []
+    
+    for endpoint in test_endpoints:
+        try:
+            url = BASE_URL + endpoint
+            logging.info(f"Тестирую: {url}")
+            response = scraper.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                working_endpoints.append(endpoint)
+                logging.info(f"✅ {endpoint} - работает (статус: {response.status_code})")
+                
+                # Показываем структуру ответа для понимания
+                try:
+                    data = response.json()
+                    logging.info(f"   Структура ответа: {type(data)} - {str(data)[:200]}...")
+                except:
+                    logging.info(f"   Ответ не является JSON: {response.text[:200]}...")
+            else:
+                logging.warning(f"❌ {endpoint} - статус: {response.status_code}")
+                
+        except Exception as e:
+            logging.warning(f"❌ {endpoint} - ошибка: {e}")
+    
+    if working_endpoints:
+        logging.info(f"🎯 Работающие эндпоинты: {working_endpoints}")
+        return working_endpoints
+    else:
+        logging.error("🚨 Не найдено ни одного работающего API эндпоинта!")
+        return []
+
 def generate_signature(nonce, key, secret_bytes):
     """Генерирует подпись HMAC-SHA256"""
     string_to_sign = nonce + key
@@ -748,36 +795,62 @@ def get_ticker_price(symbol):
             time.time() - prices_cache["last_update"] < prices_cache["cache_duration"]):
             return prices_cache["data"][symbol]
     
-    try:
-        path = f"/public/markets/{symbol}/tickers"
-        url = BASE_URL + path
-        response = scraper.get(url, timeout=30)
-        response.raise_for_status()
-        ticker = response.json()
-        
-        if not isinstance(ticker, dict):
-            logging.warning(f"Некорректный формат тикера для {symbol}")
-            return None
-        
-        price = float(ticker.get('last', 0))
-        
-        with cache_lock:
-            prices_cache["data"][symbol] = price
-            prices_cache["last_update"] = time.time()
-        
-        # Сохраняем в базу данных
-        db_manager.insert_price_history(
-            symbol=symbol.upper(),
-            price=price,
-            volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
-            high=float(ticker.get('high', 0)) if ticker.get('high') else None,
-            low=float(ticker.get('low', 0)) if ticker.get('low') else None
-        )
-        
-        return price
-    except Exception as e:
-        logging.error(f"Ошибка получения цены для {symbol}: {e}")
-        return None
+    # Пробуем разные возможные эндпоинты для получения тикера
+    possible_endpoints = [
+        f"/trade/public/tickers/{symbol}",
+        f"/public/markets/{symbol}/tickers",
+        f"/tickers/{symbol}",
+        f"/trade/tickers/{symbol}"
+    ]
+    
+    for endpoint in possible_endpoints:
+        try:
+            url = BASE_URL + endpoint
+            logging.info(f"Пробуем получить тикер {symbol} через: {endpoint}")
+            response = scraper.get(url, timeout=30)
+            response.raise_for_status()
+            ticker = response.json()
+            
+            if not isinstance(ticker, dict):
+                logging.warning(f"Некорректный формат тикера для {symbol} от {endpoint}: {ticker}")
+                continue
+            
+            # Пробуем разные возможные ключи для цены
+            price = None
+            for price_key in ['last', 'bid', 'buy', 'price']:
+                if ticker.get(price_key):
+                    try:
+                        price = float(ticker.get(price_key))
+                        if price > 0:
+                            logging.info(f"✅ Найдена цена для {symbol} через ключ '{price_key}': {price}")
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            
+            if price and price > 0:
+                with cache_lock:
+                    prices_cache["data"][symbol] = price
+                    prices_cache["last_update"] = time.time()
+                
+                # Сохраняем в базу данных
+                db_manager.insert_price_history(
+                    symbol=symbol.upper(),
+                    price=price,
+                    volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
+                    high=float(ticker.get('high', 0)) if ticker.get('high') else None,
+                    low=float(ticker.get('low', 0)) if ticker.get('low') else None
+                )
+                
+                return price
+            else:
+                logging.warning(f"Не удалось найти валидную цену в тикере {symbol} от {endpoint}")
+                
+        except Exception as e:
+            logging.warning(f"Ошибка при запросе тикера {symbol} к {endpoint}: {e}")
+            continue
+    
+    logging.error(f"Не удалось получить цену для {symbol} ни с одного эндпоинта")
+    return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_orderbook(symbol):
@@ -790,25 +863,39 @@ def get_orderbook(symbol):
             time.time() - orderbook_cache["last_update"][symbol] < orderbook_cache["cache_duration"]):
             return orderbook_cache["data"][symbol]
     
-    try:
-        path = f"/public/markets/{symbol}/order-book"
-        url = BASE_URL + path
-        response = scraper.get(url, timeout=30)
-        response.raise_for_status()
-        orderbook = response.json()
-        
-        if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-            logging.warning(f"Пустая книга ордеров для {symbol}")
-            return None
-        
-        with cache_lock:
-            orderbook_cache["data"][symbol] = orderbook
-            orderbook_cache["last_update"][symbol] = time.time()
-        
-        return orderbook
-    except Exception as e:
-        logging.error(f"Ошибка получения книги ордеров для {symbol}: {e}")
-        return None
+    # Пробуем разные возможные эндпоинты для получения книги ордеров
+    possible_endpoints = [
+        f"/trade/public/order-book/{symbol}",
+        f"/public/markets/{symbol}/order-book",
+        f"/order-book/{symbol}",
+        f"/trade/order-book/{symbol}"
+    ]
+    
+    for endpoint in possible_endpoints:
+        try:
+            url = BASE_URL + endpoint
+            logging.info(f"Пробуем получить книгу ордеров {symbol} через: {endpoint}")
+            response = scraper.get(url, timeout=30)
+            response.raise_for_status()
+            orderbook = response.json()
+            
+            if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+                logging.warning(f"Пустая или некорректная книга ордеров для {symbol} от {endpoint}")
+                continue
+            
+            with cache_lock:
+                orderbook_cache["data"][symbol] = orderbook
+                orderbook_cache["last_update"][symbol] = time.time()
+            
+            logging.info(f"✅ Успешно получена книга ордеров для {symbol} через {endpoint}")
+            return orderbook
+            
+        except Exception as e:
+            logging.warning(f"Ошибка при запросе книги ордеров {symbol} к {endpoint}: {e}")
+            continue
+    
+    logging.error(f"Не удалось получить книгу ордеров для {symbol} ни с одного эндпоинта")
+    return None
 
 def calculate_volatility(orderbook):
     """Расчет волатильности на основе книги ордеров"""
@@ -1612,6 +1699,7 @@ if bot:
 • `/markets` - показать доступные торговые пары
 • `/config` - показать текущую конфигурацию
 • `/health` - проверить состояние бота
+• `/test_api` - протестировать API эндпоинты (админ)
 • `/restart` - перезапустить бота (админ)
 • `/donate` - поддержать разработчика
 • `/help` - показать эту справку
@@ -1632,6 +1720,30 @@ if bot:
         if str(message.chat.id) == ADMIN_CHAT_ID:
             network_status = "✅ OK" if check_network_connectivity() else "❌ Error"
             bot.reply_to(message, f"🤖 Бот: Активен\n🌐 Сеть: {network_status}")
+        else:
+            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+
+    @bot.message_handler(commands=['test_api'])
+    def test_api_endpoints_cmd(message):
+        """Тестирование API эндпоинтов"""
+        if str(message.chat.id) == ADMIN_CHAT_ID:
+            bot.reply_to(message, "🔍 Тестирую API эндпоинты...")
+            
+            def test_thread():
+                try:
+                    working_endpoints = test_api_endpoints()
+                    if working_endpoints:
+                        response = "✅ **API тест завершен**\n\n🎯 **Работающие эндпоинты:**\n"
+                        for endpoint in working_endpoints:
+                            response += f"• `{endpoint}`\n"
+                    else:
+                        response = "❌ **API тест завершен**\n\n🚨 Не найдено ни одного работающего эндпоинта!"
+                    
+                    bot.send_message(message.chat.id, response, parse_mode='Markdown')
+                except Exception as e:
+                    bot.send_message(message.chat.id, f"❌ Ошибка тестирования API: {e}")
+            
+            threading.Thread(target=test_thread).start()
         else:
             bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
@@ -1995,6 +2107,9 @@ def main():
             return
         
         logging.info("✅ Supabase настройки проверены")
+        
+        # Тестируем API эндпоинты для поиска работающих
+        test_api_endpoints()
         
         # Загружаем состояние кэша
         load_cache_state()
