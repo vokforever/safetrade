@@ -430,6 +430,26 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка получения решений ИИ: {e}")
             return []
+    
+    def cleanup_duplicate_trading_pairs(self):
+        """Очистка дублирующихся торговых пар"""
+        try:
+            # Получаем все дублирующиеся записи
+            result = self.supabase.rpc('cleanup_duplicate_trading_pairs').execute()
+            logging.info("Очистка дублирующихся торговых пар завершена")
+            return True
+        except Exception as e:
+            logging.warning(f"Не удалось очистить дублирующиеся записи: {e}")
+            return False
+    
+    def get_trading_pairs_count(self):
+        """Получение количества торговых пар в базе"""
+        try:
+            result = self.supabase.table('safetrade_trading_pairs').select('symbol', count='exact').execute()
+            return result.count if hasattr(result, 'count') else len(result.data)
+        except Exception as e:
+            logging.error(f"Ошибка получения количества торговых пар: {e}")
+            return 0
 
 # Инициализация менеджера базы данных будет выполнена после создания Supabase клиента
 
@@ -695,7 +715,7 @@ def get_all_markets():
                     markets_cache["data"] = usdt_markets
                     markets_cache["last_update"] = time.time()
                 
-                # Сохраняем в базу данных
+                # Сохраняем в базу данных (используем upsert для избежания дублирования)
                 save_markets_to_db(usdt_markets)
                 
                 return usdt_markets
@@ -713,14 +733,42 @@ def get_all_markets():
 def save_markets_to_db(markets):
     """Сохраняет торговые пары в базу данных"""
     try:
+        saved_count = 0
+        error_count = 0
+        
+        # Получаем текущее количество записей
+        current_count = db_manager.get_trading_pairs_count()
+        logging.info(f"Текущее количество торговых пар в БД: {current_count}")
+        
         for market in markets:
-            db_manager.insert_trading_pair(
-                symbol=market.get('id', ''),
-                base_currency=market.get('base_unit', ''),
-                quote_currency=market.get('quote_currency', ''),
-                is_active=True
-            )
-        logging.info(f"Сохранено {len(markets)} торговых пар в Supabase")
+            try:
+                result = db_manager.insert_trading_pair(
+                    symbol=market.get('id', ''),
+                    base_currency=market.get('base_unit', ''),
+                    quote_currency=market.get('quote_unit', ''),  # Исправлено с quote_currency на quote_unit
+                    is_active=True
+                )
+                if result:
+                    saved_count += 1
+                else:
+                    error_count += 1
+            except Exception as e:
+                error_count += 1
+                # Логируем ошибку, но продолжаем с другими парами
+                if "duplicate key" in str(e).lower():
+                    logging.debug(f"Торговая пара {market.get('id', '')} уже существует")
+                else:
+                    logging.debug(f"Ошибка при сохранении пары {market.get('id', '')}: {e}")
+                continue
+        
+        final_count = db_manager.get_trading_pairs_count()
+        logging.info(f"Сохранено {saved_count} новых торговых пар, ошибок: {error_count}")
+        logging.info(f"Общее количество торговых пар в БД: {final_count}")
+        
+        # Если много ошибок дублирования, предлагаем очистку
+        if error_count > len(markets) * 0.5:  # Если больше 50% ошибок
+            logging.info("Обнаружено много дублирующихся записей. Рекомендуется очистка БД.")
+            
     except Exception as e:
         logging.error(f"Ошибка при сохранении торговых пар: {e}")
 
@@ -768,9 +816,21 @@ def get_sellable_balances():
             balance_amount = float(balance.get('balance', 0))
             
             # Пропускаем исключенные валюты и нулевые балансы
-            if (currency in EXCLUDED_CURRENCIES or 
-                balance_amount <= 0 or
-                currency not in available_currencies):
+            if (currency in EXCLUDED_CURRENCIES or balance_amount <= 0):
+                continue
+            
+            # Проверяем, есть ли торговая пара для этой валюты
+            if currency not in available_currencies:
+                logging.debug(f"Валюты {currency} нет в доступных торговых парах")
+                # Пробуем найти альтернативные пары
+                alternative_pairs = [f"{currency.lower()}btc", f"{currency.lower()}eth", f"{currency.lower()}usdc"]
+                has_alternative = any(any(market.get('id', '').lower() == alt for market in markets) for alt in alternative_pairs)
+                
+                if has_alternative:
+                    logging.info(f"Найдена альтернативная торговая пара для {currency}")
+                    sellable_balances[currency] = balance_amount
+                else:
+                    logging.debug(f"Нет альтернативных торговых пар для {currency}")
                 continue
             
             sellable_balances[currency] = balance_amount
@@ -789,6 +849,9 @@ def get_ticker_price(symbol):
     """Получает текущую цену для указанной торговой пары"""
     global prices_cache
     
+    # Нормализуем символ (приводим к нижнему регистру)
+    symbol = symbol.lower()
+    
     with cache_lock:
         if (symbol in prices_cache["data"] and 
             prices_cache["last_update"] and 
@@ -796,11 +859,12 @@ def get_ticker_price(symbol):
             return prices_cache["data"][symbol]
     
     # Пробуем разные возможные эндпоинты для получения тикера
+    # Приоритет отдаем рабочим эндпоинтам из логов
     possible_endpoints = [
-        f"/trade/public/tickers/{symbol}",
-        f"/public/markets/{symbol}/tickers",
-        f"/tickers/{symbol}",
-        f"/trade/tickers/{symbol}"
+        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт
+        f"/markets/{symbol}/tickers",       # Альтернативный
+        f"/public/markets/{symbol}/tickers", # Резервный
+        f"/tickers/{symbol}"                # Последний вариант
     ]
     
     for endpoint in possible_endpoints:
@@ -833,23 +897,81 @@ def get_ticker_price(symbol):
                     prices_cache["last_update"] = time.time()
                 
                 # Сохраняем в базу данных
-                db_manager.insert_price_history(
-                    symbol=symbol.upper(),
-                    price=price,
-                    volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
-                    high=float(ticker.get('high', 0)) if ticker.get('high') else None,
-                    low=float(ticker.get('low', 0)) if ticker.get('low') else None
-                )
+                try:
+                    db_manager.insert_price_history(
+                        timestamp=datetime.now().isoformat(),
+                        symbol=symbol.upper(),
+                        price=price,
+                        volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
+                        high=float(ticker.get('high', 0)) if ticker.get('high') else None,
+                        low=float(ticker.get('low', 0)) if ticker.get('low') else None
+                    )
+                except Exception as e:
+                    logging.warning(f"Ошибка при сохранении истории цен для {symbol}: {e}")
                 
                 return price
             else:
                 logging.warning(f"Не удалось найти валидную цену в тикере {symbol} от {endpoint}")
                 
         except Exception as e:
-            logging.warning(f"Ошибка при запросе тикера {symbol} к {endpoint}: {e}")
+            if "404" in str(e):
+                logging.debug(f"Эндпоинт {endpoint} не найден для {symbol}")
+            elif "401" in str(e):
+                logging.debug(f"Эндпоинт {endpoint} требует авторизации для {symbol}")
+            else:
+                logging.warning(f"Ошибка при запросе тикера {symbol} к {endpoint}: {e}")
             continue
     
+    # Если не удалось получить цену, пробуем альтернативные варианты символа
+    if symbol.endswith('usdt'):
+        base_symbol = symbol[:-4]  # Убираем 'usdt'
+        # Пробуем с другими базовыми валютами
+        alternative_symbols = [f"{base_symbol}btc", f"{base_symbol}eth", f"{base_symbol}usdc"]
+        
+        for alt_symbol in alternative_symbols:
+            logging.info(f"Пробуем альтернативный символ: {alt_symbol}")
+            alt_price = get_ticker_price_internal(alt_symbol)
+            if alt_price:
+                logging.info(f"✅ Найдена цена для {symbol} через альтернативный символ {alt_symbol}: {alt_price}")
+                return alt_price
+    
     logging.error(f"Не удалось получить цену для {symbol} ни с одного эндпоинта")
+    return None
+
+def get_ticker_price_internal(symbol):
+    """Внутренняя функция для получения цены (без retry)"""
+    # Пробуем разные возможные эндпоинты для получения тикера
+    possible_endpoints = [
+        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт
+        f"/markets/{symbol}/tickers",       # Альтернативный
+        f"/public/markets/{symbol}/tickers", # Резервный
+        f"/tickers/{symbol}"                # Последний вариант
+    ]
+    
+    for endpoint in possible_endpoints:
+        try:
+            url = BASE_URL + endpoint
+            response = scraper.get(url, timeout=30)
+            response.raise_for_status()
+            ticker = response.json()
+            
+            if not isinstance(ticker, dict):
+                continue
+            
+            # Пробуем разные возможные ключи для цены
+            price = None
+            for price_key in ['last', 'bid', 'buy', 'price']:
+                if ticker.get(price_key):
+                    try:
+                        price = float(ticker.get(price_key))
+                        if price > 0:
+                            return price
+                    except (ValueError, TypeError):
+                        continue
+            
+        except Exception:
+            continue
+    
     return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
