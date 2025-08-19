@@ -388,7 +388,7 @@ class DatabaseManager:
             return None
     
     def insert_trading_pair(self, symbol: str, base_currency: str, quote_currency: str, is_active: bool = True):
-        """Вставка торговой пары"""
+        """Вставка торговой пары с правильной обработкой дубликатов"""
         try:
             data = {
                 'symbol': symbol,
@@ -398,11 +398,22 @@ class DatabaseManager:
                 'last_updated': datetime.now().isoformat(),
                 'created_at': datetime.now().isoformat()
             }
-            result = self.supabase.table('safetrade_trading_pairs').upsert(data).execute()
+            
+            # Используем upsert с указанием конфликтного поля
+            result = self.supabase.table('safetrade_trading_pairs').upsert(
+                data, 
+                on_conflict='symbol'  # Указываем поле для разрешения конфликтов
+            ).execute()
+            
             return result.data[0] if result.data else None
         except Exception as e:
-            logging.error(f"Ошибка вставки торговой пары: {e}")
-            return None
+            # Улучшенная обработка ошибок дублирования
+            if 'duplicate key' in str(e).lower() or '23505' in str(e):
+                logging.debug(f"Торговая пара {symbol} уже существует, пропускаем")
+                return None
+            else:
+                logging.error(f"Ошибка вставки торговой пары {symbol}: {e}")
+                return None
     
     def insert_performance_metric(self, timestamp: str, metric_type: str, metric_name: str, 
                                 value: float, metadata: str = None):
@@ -434,13 +445,107 @@ class DatabaseManager:
     def cleanup_duplicate_trading_pairs(self):
         """Очистка дублирующихся торговых пар"""
         try:
-            # Получаем все дублирующиеся записи
-            result = self.supabase.rpc('cleanup_duplicate_trading_pairs').execute()
+            # SQL запрос для удаления дубликатов, оставляя только первую запись
+            cleanup_sql = """
+            DELETE FROM safetrade_trading_pairs 
+            WHERE id NOT IN (
+                SELECT MIN(id) 
+                FROM safetrade_trading_pairs 
+                GROUP BY symbol
+            );
+            """
+            
+            # Выполняем SQL запрос через Supabase
+            result = self.supabase.rpc('exec_sql', {'sql': cleanup_sql}).execute()
             logging.info("Очистка дублирующихся торговых пар завершена")
             return True
         except Exception as e:
-            logging.warning(f"Не удалось очистить дублирующиеся записи: {e}")
+            # Если RPC не работает, используем альтернативный метод
+            try:
+                logging.info("Попытка альтернативной очистки дубликатов...")
+                # Получаем все символы с дубликатами
+                result = self.supabase.table('safetrade_trading_pairs').select('symbol').execute()
+                
+                if result.data:
+                    symbols = [row['symbol'] for row in result.data]
+                    # Создаем временную таблицу с уникальными записями
+                    unique_pairs = {}
+                    for row in result.data:
+                        symbol = row['symbol']
+                        if symbol not in unique_pairs:
+                            unique_pairs[symbol] = row
+                    
+                    # Очищаем таблицу и вставляем уникальные записи
+                    self.supabase.table('safetrade_trading_pairs').delete().neq('id', '').execute()
+                    
+                    for pair in unique_pairs.values():
+                        self.supabase.table('safetrade_trading_pairs').insert(pair).execute()
+                    
+                    logging.info(f"Очистка завершена. Оставлено {len(unique_pairs)} уникальных записей")
+                    return True
+            except Exception as alt_e:
+                logging.warning(f"Не удалось очистить дублирующиеся записи: {e}, альтернативный метод: {alt_e}")
+                return False
+    
+    def force_cleanup_duplicates(self):
+        """Принудительная очистка дубликатов с пересозданием таблицы"""
+        try:
+            logging.info("Начинаем принудительную очистку дубликатов...")
+            
+            # Получаем все уникальные записи
+            result = self.supabase.table('safetrade_trading_pairs').select('*').execute()
+            
+            if not result.data:
+                logging.info("Таблица пуста, очистка не требуется")
+                return True
+            
+            # Создаем словарь уникальных записей по символу
+            unique_records = {}
+            for record in result.data:
+                symbol = record['symbol']
+                if symbol not in unique_records:
+                    unique_records[symbol] = record
+            
+            logging.info(f"Найдено {len(result.data)} записей, уникальных: {len(unique_records)}")
+            
+            # Очищаем таблицу
+            self.supabase.table('safetrade_trading_pairs').delete().neq('id', '').execute()
+            logging.info("Таблица очищена")
+            
+            # Вставляем уникальные записи
+            for record in unique_records.values():
+                # Убираем id для создания нового
+                record_copy = record.copy()
+                if 'id' in record_copy:
+                    del record_copy['id']
+                if 'created_at' in record_copy:
+                    del record_copy['created_at']
+                
+                self.supabase.table('safetrade_trading_pairs').insert(record_copy).execute()
+            
+            logging.info(f"Восстановлено {len(unique_records)} уникальных записей")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Ошибка при принудительной очистке: {e}")
             return False
+    
+    def get_duplicate_count(self):
+        """Получение количества дублирующихся записей"""
+        try:
+            result = self.supabase.table('safetrade_trading_pairs').select('symbol').execute()
+            
+            if not result.data:
+                return 0
+            
+            symbols = [row['symbol'] for row in result.data]
+            unique_symbols = set(symbols)
+            duplicate_count = len(symbols) - len(unique_symbols)
+            
+            return duplicate_count
+        except Exception as e:
+            logging.error(f"Ошибка при подсчете дубликатов: {e}")
+            return 0
     
     def get_trading_pairs_count(self):
         """Получение количества торговых пар в базе"""
@@ -450,6 +555,35 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка получения количества торговых пар: {e}")
             return 0
+    
+    def check_database_health(self):
+        """Проверка здоровья базы данных и автоматическая очистка при необходимости"""
+        try:
+            total_count = self.get_trading_pairs_count()
+            duplicate_count = self.get_duplicate_count()
+            
+            if duplicate_count > 0:
+                logging.warning(f"Обнаружено {duplicate_count} дублирующихся записей из {total_count} общих")
+                
+                # Если дубликатов больше 10% от общего количества, запускаем автоматическую очистку
+                if duplicate_count > total_count * 0.1:
+                    logging.info("Запуск автоматической очистки дубликатов...")
+                    if self.force_cleanup_duplicates():
+                        logging.info("Автоматическая очистка завершена успешно")
+                        return True
+                    else:
+                        logging.error("Автоматическая очистка завершилась с ошибкой")
+                        return False
+                else:
+                    logging.info("Количество дубликатов в допустимых пределах")
+                    return True
+            else:
+                logging.info("Дублирующихся записей не обнаружено")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Ошибка при проверке здоровья БД: {e}")
+            return False
 
 # Инициализация менеджера базы данных будет выполнена после создания Supabase клиента
 
@@ -731,44 +865,67 @@ def get_all_markets():
     return get_markets_from_db()
 
 def save_markets_to_db(markets):
-    """Сохраняет торговые пары в базу данных"""
+    """Сохраняет торговые пары в базу данных с улучшенной обработкой дубликатов"""
     try:
         saved_count = 0
+        skipped_count = 0
         error_count = 0
         
         # Получаем текущее количество записей
         current_count = db_manager.get_trading_pairs_count()
         logging.info(f"Текущее количество торговых пар в БД: {current_count}")
         
+        # Получаем существующие символы для проверки
+        existing_symbols = set()
+        try:
+            result = db_manager.supabase.table('safetrade_trading_pairs').select('symbol').execute()
+            existing_symbols = {row['symbol'] for row in result.data}
+        except Exception as e:
+            logging.warning(f"Не удалось получить существующие символы: {e}")
+        
         for market in markets:
+            symbol = market.get('id', '')
+            if not symbol:
+                continue
+                
             try:
+                # Проверяем, существует ли уже символ
+                if symbol in existing_symbols:
+                    skipped_count += 1
+                    continue
+                
                 result = db_manager.insert_trading_pair(
-                    symbol=market.get('id', ''),
+                    symbol=symbol,
                     base_currency=market.get('base_unit', ''),
-                    quote_currency=market.get('quote_unit', ''),  # Исправлено с quote_currency на quote_unit
+                    quote_currency=market.get('quote_unit', ''),
                     is_active=True
                 )
                 if result:
                     saved_count += 1
+                    existing_symbols.add(symbol)  # Добавляем в локальный кэш
                 else:
                     error_count += 1
             except Exception as e:
                 error_count += 1
-                # Логируем ошибку, но продолжаем с другими парами
-                if "duplicate key" in str(e).lower():
-                    logging.debug(f"Торговая пара {market.get('id', '')} уже существует")
-                else:
-                    logging.debug(f"Ошибка при сохранении пары {market.get('id', '')}: {e}")
+                # Логируем только серьезные ошибки
+                if "duplicate key" not in str(e).lower() and "23505" not in str(e):
+                    logging.debug(f"Ошибка при сохранении пары {symbol}: {e}")
                 continue
         
         final_count = db_manager.get_trading_pairs_count()
-        logging.info(f"Сохранено {saved_count} новых торговых пар, ошибок: {error_count}")
+        logging.info(f"Сохранено {saved_count} новых торговых пар, пропущено {skipped_count}, ошибок: {error_count}")
         logging.info(f"Общее количество торговых пар в БД: {final_count}")
         
+        # Проверяем здоровье базы данных после сохранения
+        if error_count > 0 or skipped_count > 0:
+            logging.info("Проверка здоровья базы данных...")
+            db_manager.check_database_health()
+        
         # Если много ошибок дублирования, предлагаем очистку
-        if error_count > len(markets) * 0.5:  # Если больше 50% ошибок
+        if error_count > len(markets) * 0.3:  # Если больше 30% ошибок
             logging.info("Обнаружено много дублирующихся записей. Рекомендуется очистка БД.")
-            
+            logging.info("Для принудительной очистки используйте: db_manager.force_cleanup_duplicates()")
+        
     except Exception as e:
         logging.error(f"Ошибка при сохранении торговых пар: {e}")
 
