@@ -431,8 +431,7 @@ class DatabaseManager:
             logging.error(f"Ошибка получения решений ИИ: {e}")
             return []
 
-# Инициализация менеджера базы данных
-db_manager = DatabaseManager(supabase)
+# Инициализация менеджера базы данных будет выполнена после создания Supabase клиента
 
 # --- УЛУЧШЕННЫЙ TELEGRAM BOT С RETRY МЕХАНИЗМОМ ---
 class RobustTeleBot(telebot.TeleBot):
@@ -486,6 +485,10 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 logging.info("✅ Supabase подключен")
+
+# Инициализация менеджера базы данных
+db_manager = DatabaseManager(supabase)
+logging.info("✅ Менеджер базы данных инициализирован")
 
 # Инициализируем Cerebras только если есть API ключ
 cerebras_client = None
@@ -615,35 +618,50 @@ def get_all_markets():
             time.time() - markets_cache["last_update"] < markets_cache["cache_duration"]):
             return markets_cache["data"]
     
-    try:
-        path = "/public/markets"
-        url = BASE_URL + path
-        response = scraper.get(url, timeout=30)
-        response.raise_for_status()
-        markets = response.json()
-        
-        if isinstance(markets, list):
-            # Фильтруем только пары с USDT
-            usdt_markets = [
-                market for market in markets 
-                if market.get('quote_unit') == 'usdt' and 
-                   market.get('base_unit', '').upper() not in EXCLUDED_CURRENCIES
-            ]
-            
-            with cache_lock:
-                markets_cache["data"] = usdt_markets
-                markets_cache["last_update"] = time.time()
-            
-            # Сохраняем в базу данных
-            save_markets_to_db(usdt_markets)
-            
-            return usdt_markets
-    except Exception as e:
-        logging.error(f"Ошибка при получении торговых пар: {e}")
-        # В случае ошибки, пробуем получить из базы данных
-        return get_markets_from_db()
+    # Пробуем разные возможные эндпоинты для получения торговых пар
+    possible_endpoints = [
+        "/trade/public/markets",
+        "/public/markets", 
+        "/markets",
+        "/trade/markets"
+    ]
     
-    return []
+    for endpoint in possible_endpoints:
+        try:
+            url = BASE_URL + endpoint
+            logging.info(f"Пробуем получить торговые пары через: {url}")
+            response = scraper.get(url, timeout=30)
+            response.raise_for_status()
+            markets = response.json()
+            
+            if isinstance(markets, list) and len(markets) > 0:
+                logging.info(f"✅ Успешно получены торговые пары через {endpoint}: {len(markets)} пар")
+                
+                # Фильтруем только пары с USDT
+                usdt_markets = [
+                    market for market in markets 
+                    if market.get('quote_unit') == 'usdt' and 
+                       market.get('base_unit', '').upper() not in EXCLUDED_CURRENCIES
+                ]
+                
+                with cache_lock:
+                    markets_cache["data"] = usdt_markets
+                    markets_cache["last_update"] = time.time()
+                
+                # Сохраняем в базу данных
+                save_markets_to_db(usdt_markets)
+                
+                return usdt_markets
+            else:
+                logging.warning(f"Получен пустой или некорректный ответ от {endpoint}: {markets}")
+                
+        except Exception as e:
+            logging.warning(f"Ошибка при запросе к {endpoint}: {e}")
+            continue
+    
+    logging.error("Не удалось получить торговые пары ни с одного эндпоинта")
+    # В случае ошибки, пробуем получить из базы данных
+    return get_markets_from_db()
 
 def save_markets_to_db(markets):
     """Сохраняет торговые пары в базу данных"""
