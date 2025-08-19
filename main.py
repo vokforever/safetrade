@@ -80,6 +80,22 @@ nameserver 1.1.1.1
 # --- ЗАГРУЗКА КОНФИГУРАЦИИ ---
 load_dotenv()
 # Конфигурация по умолчанию
+# 
+# ОБЯЗАТЕЛЬНЫЕ переменные окружения (для работы бота):
+# - SAFETRADE_API_KEY - API ключ SafeTrade
+# - SAFETRADE_API_SECRET - API секрет SafeTrade
+#
+# ОПЦИОНАЛЬНЫЕ переменные окружения (для расширенного функционала):
+# - SAFETRADE_TELEGRAM_BOT_TOKEN - Токен Telegram бота (для Telegram интерфейса)
+# - SAFETRADE_ADMIN_CHAT_ID - ID чата администратора (для уведомлений)
+# - SAFETRADE_CEREBRAS_API_KEY - API ключ Cerebras AI (для ИИ-помощника)
+# - SAFETRADE_SUPABASE_URL - URL Supabase (для облачной базы данных)
+# - SAFETRADE_SUPABASE_KEY - Ключ Supabase (для облачной базы данных)
+# - SAFETRADE_WEBHOOK_URL - URL для webhook режима (альтернатива polling)
+# - SAFETRADE_WEBHOOK_PORT - Порт для webhook режима
+#
+# ПРИМЕЧАНИЕ: Бот будет работать ТОЛЬКО с SAFETRADE_API_KEY и SAFETRADE_API_SECRET!
+# Все остальные функции будут отключены, если соответствующие переменные не указаны.
 DEFAULT_CONFIG = {
     'trading': {
         'excluded_currencies': ['USDT', 'BUSD', 'USDC'],
@@ -131,13 +147,13 @@ CONFIG = load_config()
 # Загружаем токены и ID из переменных окружения
 API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("SAFETRADE_TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("SAFETRADE_ADMIN_CHAT_ID")
+CEREBRAS_API_KEY = os.getenv("SAFETRADE_CEREBRAS_API_KEY")
 
 # Supabase настройки
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SAFETRADE_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SAFETRADE_SUPABASE_KEY")
 
 # URL для пожертвований
 DONATE_URL = "https://boosty.to/vokforever/donate"
@@ -292,82 +308,84 @@ class DatabaseManager:
             
             # Создание таблицы для хранения исторических данных о ценах
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS price_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS safetrade_price_history (
+                id SERIAL PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 symbol TEXT NOT NULL,
-                price REAL NOT NULL,
-                volume REAL,
-                high REAL,
-                low REAL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX(symbol, timestamp)
+                price NUMERIC NOT NULL,
+                volume NUMERIC,
+                high NUMERIC,
+                low NUMERIC,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
             
             # Создание таблицы для хранения истории ордеров
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS order_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS safetrade_order_history (
+                id SERIAL PRIMARY KEY,
                 order_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 order_type TEXT NOT NULL,
-                amount REAL NOT NULL,
-                price REAL,
-                total REAL,
+                amount NUMERIC NOT NULL,
+                price NUMERIC,
+                total NUMERIC,
                 status TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX(order_id),
-                INDEX(symbol, timestamp)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
             
             # Создание таблицы для хранения решений ИИ
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ai_decisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS safetrade_ai_decisions (
+                id SERIAL PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 decision_type TEXT NOT NULL,
                 decision_data TEXT NOT NULL,
                 market_data TEXT,
                 reasoning TEXT,
-                confidence REAL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX(decision_type, timestamp)
+                confidence NUMERIC,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
             
             # Создание таблицы для хранения торговых пар
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trading_pairs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS safetrade_trading_pairs (
+                id SERIAL PRIMARY KEY,
                 symbol TEXT NOT NULL UNIQUE,
                 base_currency TEXT NOT NULL,
                 quote_currency TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT 1,
+                is_active BOOLEAN DEFAULT TRUE,
                 last_updated TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX(symbol),
-                INDEX(base_currency)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
             
             # Создание таблицы для метрик производительности
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS performance_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS safetrade_performance_metrics (
+                id SERIAL PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 metric_type TEXT NOT NULL,
                 metric_name TEXT NOT NULL,
-                value REAL NOT NULL,
+                value NUMERIC NOT NULL,
                 metadata TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                INDEX(metric_type, timestamp)
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             ''')
+            
+            # Создание индексов для улучшения производительности (PostgreSQL совместимый синтаксис)
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_price_history_symbol_timestamp ON safetrade_price_history(symbol, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_order_history_order_id ON safetrade_order_history(order_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_order_history_symbol_timestamp ON safetrade_order_history(symbol, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_ai_decisions_decision_type_timestamp ON safetrade_ai_decisions(decision_type, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_trading_pairs_symbol ON safetrade_trading_pairs(symbol)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_trading_pairs_base_currency ON safetrade_trading_pairs(base_currency)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_performance_metrics_metric_type_timestamp ON safetrade_performance_metrics(metric_type, timestamp)')
             
             conn.commit()
     
@@ -377,7 +395,7 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                INSERT INTO price_history (timestamp, symbol, price, volume, high, low)
+                INSERT INTO safetrade_price_history (timestamp, symbol, price, volume, high, low)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ''', (datetime.now().isoformat(), symbol, price, volume, high, low))
                 conn.commit()
@@ -395,7 +413,7 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                INSERT OR REPLACE INTO order_history 
+                INSERT OR REPLACE INTO safetrade_order_history 
                 (order_id, timestamp, symbol, side, order_type, amount, price, total, status, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (order_id, timestamp, symbol, side, order_type, amount, price, total, status, datetime.now().isoformat()))
@@ -409,7 +427,7 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                INSERT INTO ai_decisions (timestamp, decision_type, decision_data, market_data, reasoning, confidence)
+                INSERT INTO safetrade_ai_decisions (timestamp, decision_type, decision_data, market_data, reasoning, confidence)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ''', (
                     datetime.now().isoformat(), 
@@ -429,7 +447,7 @@ class DatabaseManager:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                SELECT * FROM ai_decisions 
+                SELECT * FROM safetrade_ai_decisions 
                 ORDER BY created_at DESC 
                 LIMIT ?
                 ''', (limit,))
@@ -475,18 +493,29 @@ class RobustTeleBot(telebot.TeleBot):
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 scraper = cloudscraper.create_scraper()
-bot = RobustTeleBot(TELEGRAM_BOT_TOKEN)
+
+# Инициализируем бота только если есть токен
+bot = None
+if TELEGRAM_BOT_TOKEN:
+    bot = RobustTeleBot(TELEGRAM_BOT_TOKEN)
+else:
+    logging.warning("SAFETRADE_TELEGRAM_BOT_TOKEN не указан. Telegram бот будет отключен.")
+
+# Инициализируем Supabase только если есть настройки
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logging.info("Supabase подключен")
 else:
-    logging.warning("Supabase URL или KEY не указаны. Запись в базу данных будет отключена.")
+    logging.info("Supabase не настроен - используется локальная SQLite база")
 
+# Инициализируем Cerebras только если есть API ключ
 cerebras_client = None
 if CEREBRAS_API_KEY:
     cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+    logging.info("Cerebras AI подключен")
 else:
-    logging.warning("CEREBRAS_API_KEY не указан. Функции ИИ будут отключены.")
+    logging.info("Cerebras AI не настроен - функции ИИ отключены")
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -499,8 +528,8 @@ menu_markup.row('/health', '/restart')
 # --- WEBHOOK MODE AS FALLBACK ---
 def setup_webhook_mode():
     """Настройка webhook режима как альтернативы polling"""
-    webhook_url = os.getenv("WEBHOOK_URL")  # Добавить в переменные окружения
-    webhook_port = int(os.getenv("WEBHOOK_PORT", "8443"))
+    webhook_url = os.getenv("SAFETRADE_WEBHOOK_URL")  # SAFETRADE_WEBHOOK_URL в переменных окружения
+    webhook_port = int(os.getenv("SAFETRADE_WEBHOOK_PORT", "8443"))
     
     if webhook_url:
         try:
@@ -646,7 +675,7 @@ def save_markets_to_db(markets):
             
             for market in markets:
                 cursor.execute('''
-                INSERT OR REPLACE INTO trading_pairs 
+                INSERT OR REPLACE INTO safetrade_trading_pairs 
                 (symbol, base_currency, quote_currency, is_active, last_updated)
                 VALUES (?, ?, ?, ?, ?)
                 ''', (
@@ -669,7 +698,7 @@ def get_markets_from_db():
             
             cursor.execute('''
             SELECT symbol, base_currency, quote_currency, is_active
-            FROM trading_pairs
+            FROM safetrade_trading_pairs
             WHERE is_active = 1
             ''')
             
@@ -1525,8 +1554,8 @@ def auto_sell_all_altcoins():
             # Инвалидируем кэш после всех операций
             invalidate_cache()
             
-            # Отправляем отчет администратору
-            if ADMIN_CHAT_ID:
+            # Отправляем отчет администратору (если бот настроен)
+            if bot and ADMIN_CHAT_ID:
                 report = (
                     f"🤖 **Отчет по автопродажам**\n\n"
                     f"📊 **Статистика:**\n"
@@ -1547,8 +1576,14 @@ def auto_sell_all_altcoins():
                         report, 
                         parse_mode='Markdown'
                     )
+                    logging.info("📱 Отчет отправлен администратору")
                 except Exception as e:
                     logging.error(f"Ошибка отправки отчета админу: {e}")
+            else:
+                logging.info("📊 Отчет по автопродажам:")
+                logging.info(f"   Обработано валют: {total_processed}")
+                logging.info(f"   Успешных продаж: {successful_sales}")
+                logging.info(f"   Неудачных попыток: {failed_sales}")
             
             return {
                 "success": True,
@@ -1562,16 +1597,19 @@ def auto_sell_all_altcoins():
         error_msg = f"Критическая ошибка в автопродаже: {e}"
         logging.error(error_msg)
         
-        # Отправляем уведомление об ошибке администратору
-        if ADMIN_CHAT_ID:
+        # Отправляем уведомление об ошибке администратору (если бот настроен)
+        if bot and ADMIN_CHAT_ID:
             try:
                 bot.send_message(
                     ADMIN_CHAT_ID,
                     f"🚨 **Ошибка автопродажи**\n\n{error_msg}",
                     parse_mode='Markdown'
                 )
-            except:
-                pass
+                logging.info("📱 Уведомление об ошибке отправлено администратору")
+            except Exception as e:
+                logging.error(f"Ошибка отправки уведомления об ошибке: {e}")
+        else:
+            logging.error(f"🚨 Критическая ошибка в автопродаже: {error_msg}")
         
         return {"success": False, "message": error_msg}
 
@@ -1591,10 +1629,12 @@ def start_auto_sell_scheduler():
     logging.info(f"Планировщик автопродаж запущен с интервалом {AUTO_SELL_INTERVAL} секунд")
 
 # --- TELEGRAM BOT HANDLERS ---
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    """Приветственное сообщение"""
-    welcome_text = """
+# Проверяем, что бот инициализирован перед регистрацией обработчиков
+if bot:
+    @bot.message_handler(commands=['start', 'help'])
+    def send_welcome(message):
+        """Приветственное сообщение"""
+        welcome_text = """
 🤖 **Добро пожаловать в SafeTrade Trading Bot!**
 Этот бот поможет вам автоматизировать торговлю криптовалютами на бирже SafeTrade.
 **Доступные команды:**
@@ -1616,31 +1656,31 @@ def send_welcome(message):
 📈 Детальная аналитика
 Для начала работы используйте команду `/balance`
 """
-    
-    bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=menu_markup)
+        
+        bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=menu_markup)
 
-@bot.message_handler(commands=['health'])
-def health_check(message):
-    """Проверка состояния бота"""
-    if str(message.chat.id) == ADMIN_CHAT_ID:
-        network_status = "✅ OK" if check_network_connectivity() else "❌ Error"
-        bot.reply_to(message, f"🤖 Бот: Активен\n🌐 Сеть: {network_status}")
-    else:
-        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+        @bot.message_handler(commands=['health'])
+    def health_check(message):
+        """Проверка состояния бота"""
+        if str(message.chat.id) == ADMIN_CHAT_ID:
+            network_status = "✅ OK" if check_network_connectivity() else "❌ Error"
+            bot.reply_to(message, f"🤖 Бот: Активен\n🌐 Сеть: {network_status}")
+        else:
+            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
-@bot.message_handler(commands=['restart'])
-def restart_bot(message):
-    """Перезапуск бота"""
-    if str(message.chat.id) == ADMIN_CHAT_ID:
-        bot.reply_to(message, "🔄 Перезапуск бота...")
-        logging.info("Перезапуск бота по команде администратора")
-        # Используем graceful shutdown
-        shutdown_handler(signal.SIGINT, None)
-    else:
-        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+        @bot.message_handler(commands=['restart'])
+    def restart_bot(message):
+        """Перезапуск бота"""
+        if str(message.chat.id) == ADMIN_CHAT_ID:
+            bot.reply_to(message, "🔄 Перезапуск бота...")
+            logging.info("Перезапуск бота по команде администратора")
+            # Используем graceful shutdown
+            shutdown_handler(signal.SIGINT, None)
+        else:
+            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
-@bot.message_handler(commands=['balance'])
-def show_balance(message):
+    @bot.message_handler(commands=['balance'])
+    def show_balance(message):
     """Показывает текущие балансы"""
     try:
         balances = get_sellable_balances()
@@ -1714,7 +1754,7 @@ def show_history(message):
             cursor = conn.cursor()
             cursor.execute('''
             SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
-            FROM order_history
+            FROM safetrade_order_history
             ORDER BY created_at DESC
             LIMIT 10
             ''')
@@ -1888,6 +1928,10 @@ def handle_all_messages(message):
 # --- ЗАПУСК БОТА ---
 def start_bot():
     """Улучшенный запуск бота с проверками"""
+    if not bot:
+        logging.error("Telegram бот не инициализирован")
+        return
+        
     # Проверяем сетевое подключение
     if not check_network_connectivity():
         logging.warning("Проблемы с сетью, настраиваем DNS...")
@@ -1911,43 +1955,101 @@ def start_bot():
         logging.error(f"Критическая ошибка бота: {e}")
         sys.exit(1)
 
+def run_trading_mode():
+    """Режим работы только для торговых операций без Telegram бота"""
+    logging.info("🚀 Запуск SafeTrade в режиме торгового бота")
+    
+    try:
+        # Проверяем сетевое подключение
+        if not check_network_connectivity():
+            logging.warning("Проблемы с сетью, настраиваем DNS...")
+            configure_dns()
+            time.sleep(10)
+            
+            if not check_network_connectivity():
+                logging.error("Не удалось восстановить сетевое подключение")
+                return
+        
+        logging.info("✅ Сетевое подключение установлено")
+        
+        # Получаем текущие балансы для проверки
+        balances = get_sellable_balances()
+        if balances:
+            logging.info(f"💰 Найдены балансы: {list(balances.keys())}")
+            
+            # Запускаем автоматическую продажу
+            result = auto_sell_all_altcoins()
+            if result["success"]:
+                logging.info(f"✅ Автопродажа завершена: {result['message']}")
+            else:
+                logging.warning(f"⚠️ Автопродажа завершена с ошибками: {result['message']}")
+        else:
+            logging.info("ℹ️ Нет балансов для продажи")
+        
+        # Если включен планировщик, работаем в фоне
+        if AUTO_SELL_INTERVAL > 0:
+            logging.info(f"⏰ Планировщик активен. Следующая автопродажа через {AUTO_SELL_INTERVAL} секунд")
+            logging.info("💡 Для остановки нажмите Ctrl+C")
+            
+            try:
+                while True:
+                    time.sleep(60)  # Проверяем каждую минуту
+            except KeyboardInterrupt:
+                logging.info("Получен сигнал остановки")
+        else:
+            logging.info("✅ Торговая операция завершена")
+            
+    except Exception as e:
+        logging.error(f"❌ Ошибка в торговом режиме: {e}")
+    finally:
+        logging.info("🏁 Завершение торгового режима")
+
 def main():
     """Главная функция запуска"""
     try:
         logging.info("Запуск SafeTrade Trading Bot...")
         
+        # Проверяем обязательные переменные окружения
+        if not API_KEY or not API_SECRET:
+            logging.error("❌ Отсутствуют обязательные переменные окружения:")
+            logging.error("   - SAFETRADE_API_KEY")
+            logging.error("   - SAFETRADE_API_SECRET")
+            logging.error("Бот не может работать без API ключей SafeTrade")
+            return
+        
+        logging.info("✅ API ключи SafeTrade настроены")
+        
         # Загружаем состояние кэша
         load_cache_state()
         
-        # Проверяем соединение с API
-        if not API_KEY or not API_SECRET:
-            logging.error("Отсутствуют API ключи SafeTrade")
-            return
-        
-        # Проверяем соединение с Telegram Bot
-        if not TELEGRAM_BOT_TOKEN:
-            logging.error("Отсутствует токен Telegram бота")
-            return
-        
-        # Запускаем планировщик автопродаж
+        # Запускаем планировщик автопродаж (если настроен)
         if AUTO_SELL_INTERVAL > 0:
             start_auto_sell_scheduler()
+            logging.info(f"📅 Планировщик автопродаж запущен (интервал: {AUTO_SELL_INTERVAL} сек)")
         
-        # Отправляем уведомление о запуске
-        if ADMIN_CHAT_ID:
-            try:
-                bot.send_message(
-                    ADMIN_CHAT_ID,
-                    "🚀 **SafeTrade Trading Bot запущен!**\n\nВсе системы готовы к работе.",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logging.error(f"Ошибка отправки уведомления о запуске: {e}")
-        
-        logging.info("Бот успешно запущен и готов к работе")
-        
-        # Запускаем бота
-        start_bot()
+        # Проверяем и запускаем Telegram бота
+        if bot and TELEGRAM_BOT_TOKEN:
+            logging.info("🤖 Telegram бот настроен")
+            
+            # Отправляем уведомление о запуске
+            if ADMIN_CHAT_ID:
+                try:
+                    bot.send_message(
+                        ADMIN_CHAT_ID,
+                        "🚀 **SafeTrade Trading Bot запущен!**\n\nВсе системы готовы к работе.",
+                        parse_mode='Markdown'
+                    )
+                    logging.info("📱 Уведомление о запуске отправлено администратору")
+                except Exception as e:
+                    logging.error(f"Ошибка отправки уведомления о запуске: {e}")
+            
+            logging.info("Бот успешно запущен и готов к работе")
+            # Запускаем бота
+            start_bot()
+        else:
+            logging.info("📱 Telegram бот не настроен - запускаем в режиме торгового бота")
+            # Запускаем в режиме только торговых операций
+            run_trading_mode()
         
     except KeyboardInterrupt:
         logging.info("Получен сигнал прерывания")
@@ -1957,7 +2059,8 @@ def main():
         logging.info("Завершение работы бота...")
         # Сохраняем состояние при завершении
         save_cache_state()
-        cancel_all_active_orders()
+        if bot:  # Проверяем, что бот инициализирован
+            cancel_all_active_orders()
 
 if __name__ == "__main__":
     main()

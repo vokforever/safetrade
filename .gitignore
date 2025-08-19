@@ -17,3 +17,14 @@ __pycache__/
 .idea/
 .vscode/
 
+# База данных и SQL скрипты
+*.db
+*.sqlite
+*.sqlite3
+database_schema.sql
+trading_analytics.db
+
+# Логи и кэш
+*.log
+cache_state.json
+
