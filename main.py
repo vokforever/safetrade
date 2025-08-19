@@ -12,7 +12,6 @@ import threading
 from supabase import create_client, Client
 from cerebras.cloud.sdk import Cerebras
 import requests
-import sqlite3
 from pathlib import Path
 import random
 import math
@@ -279,185 +278,161 @@ cerebras_limiter = RateLimiter()
 
 # --- УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ ---
 class DatabaseManager:
-    def __init__(self, db_path="trading_analytics.db"):
-        self.db_path = db_path
+    def __init__(self, supabase_client: Client):
+        if not supabase_client:
+            raise ValueError("Supabase client is required")
+        self.supabase = supabase_client
         self.lock = Lock()
         self.init_database()
     
-    @contextmanager
-    def get_connection(self):
-        """Контекстный менеджер для безопасной работы с БД"""
-        conn = None
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
-            yield conn
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            logging.error(f"Ошибка базы данных: {e}")
-            raise
-        finally:
-            if conn:
-                conn.close()
-    
     def init_database(self):
-        """Инициализация базы данных"""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            
+        """Инициализация базы данных в Supabase"""
+        try:
             # Создание таблицы для хранения исторических данных о ценах
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS safetrade_price_history (
-                id SERIAL PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                price NUMERIC NOT NULL,
-                volume NUMERIC,
-                high NUMERIC,
-                low NUMERIC,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+            self.supabase.table('safetrade_price_history').select('*').limit(1).execute()
+            logging.info("Таблица safetrade_price_history доступна")
             
             # Создание таблицы для хранения истории ордеров
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS safetrade_order_history (
-                id SERIAL PRIMARY KEY,
-                order_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                order_type TEXT NOT NULL,
-                amount NUMERIC NOT NULL,
-                price NUMERIC,
-                total NUMERIC,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+            self.supabase.table('safetrade_order_history').select('*').limit(1).execute()
+            logging.info("Таблица safetrade_order_history доступна")
             
             # Создание таблицы для хранения решений ИИ
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS safetrade_ai_decisions (
-                id SERIAL PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                decision_type TEXT NOT NULL,
-                decision_data TEXT NOT NULL,
-                market_data TEXT,
-                reasoning TEXT,
-                confidence NUMERIC,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+            self.supabase.table('safetrade_ai_decisions').select('*').limit(1).execute()
+            logging.info("Таблица safetrade_ai_decisions доступна")
             
             # Создание таблицы для хранения торговых пар
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS safetrade_trading_pairs (
-                id SERIAL PRIMARY KEY,
-                symbol TEXT NOT NULL UNIQUE,
-                base_currency TEXT NOT NULL,
-                quote_currency TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE,
-                last_updated TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+            self.supabase.table('safetrade_trading_pairs').select('*').limit(1).execute()
+            logging.info("Таблица safetrade_trading_pairs доступна")
             
             # Создание таблицы для метрик производительности
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS safetrade_performance_metrics (
-                id SERIAL PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                metric_type TEXT NOT NULL,
-                metric_name TEXT NOT NULL,
-                value NUMERIC NOT NULL,
-                metadata TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            ''')
+            self.supabase.table('safetrade_performance_metrics').select('*').limit(1).execute()
+            logging.info("Таблица safetrade_performance_metrics доступна")
             
-            # Создание индексов для улучшения производительности (PostgreSQL совместимый синтаксис)
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_price_history_symbol_timestamp ON safetrade_price_history(symbol, timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_order_history_order_id ON safetrade_order_history(order_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_order_history_symbol_timestamp ON safetrade_order_history(symbol, timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_ai_decisions_decision_type_timestamp ON safetrade_ai_decisions(decision_type, timestamp)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_trading_pairs_symbol ON safetrade_trading_pairs(symbol)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_trading_pairs_base_currency ON safetrade_trading_pairs(base_currency)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_safetrade_performance_metrics_metric_type_timestamp ON safetrade_performance_metrics(metric_type, timestamp)')
-            
-            conn.commit()
-    
-    def save_price_data(self, symbol, price, volume=None, high=None, low=None):
-        """Сохраняет данные о цене в БД"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                INSERT INTO safetrade_price_history (timestamp, symbol, price, volume, high, low)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (datetime.now().isoformat(), symbol, price, volume, high, low))
-                conn.commit()
         except Exception as e:
-            logging.error(f"Ошибка сохранения цены: {e}")
+            logging.error(f"Ошибка инициализации базы данных: {e}")
+            raise
     
-    def save_order_data(self, order_id, timestamp, symbol, side, order_type, amount, price, total, status):
-        """Сохраняет данные об ордере в БД"""
-        # Валидация order_type
-        valid_types = ["market", "limit", "twap", "iceberg", "adaptive"]
-        if order_type not in valid_types:
-            raise ValueError(f"Недопустимый order_type: {order_type}. Допустимые: {valid_types}")
-        
+    def insert_price_history(self, timestamp: str, symbol: str, price: float, 
+                           volume: float = None, high: float = None, low: float = None):
+        """Вставка исторических данных о ценах"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                INSERT OR REPLACE INTO safetrade_order_history 
-                (order_id, timestamp, symbol, side, order_type, amount, price, total, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (order_id, timestamp, symbol, side, order_type, amount, price, total, status, datetime.now().isoformat()))
-                conn.commit()
+            data = {
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'price': price,
+                'volume': volume,
+                'high': high,
+                'low': low,
+                'created_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_price_history').insert(data).execute()
+            return result.data[0] if result.data else None
         except Exception as e:
-            logging.error(f"Ошибка сохранения ордера: {e}")
+            logging.error(f"Ошибка вставки данных о ценах: {e}")
+            return None
     
-    def save_ai_decision(self, decision_type, decision_data, market_data, reasoning, confidence=0.0):
-        """Сохраняет решение ИИ в БД"""
+    def insert_order_history(self, order_id: str, timestamp: str, symbol: str, 
+                           side: str, order_type: str, amount: float, 
+                           price: float = None, total: float = None, status: str = "pending"):
+        """Вставка истории ордеров"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                INSERT INTO safetrade_ai_decisions (timestamp, decision_type, decision_data, market_data, reasoning, confidence)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    datetime.now().isoformat(), 
-                    decision_type, 
-                    json.dumps(decision_data), 
-                    json.dumps(market_data), 
-                    reasoning,
-                    confidence
-                ))
-                conn.commit()
+            data = {
+                'order_id': order_id,
+                'timestamp': timestamp,
+                'symbol': symbol,
+                'side': side,
+                'order_type': order_type,
+                'amount': amount,
+                'price': price,
+                'total': total,
+                'status': status,
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_order_history').insert(data).execute()
+            return result.data[0] if result.data else None
         except Exception as e:
-            logging.error(f"Ошибка сохранения решения ИИ: {e}")
+            logging.error(f"Ошибка вставки истории ордеров: {e}")
+            return None
     
-    def get_recent_ai_decisions(self, limit=10):
-        """Получает последние решения ИИ"""
+    def update_order_status(self, order_id: str, status: str):
+        """Обновление статуса ордера"""
         try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                SELECT * FROM safetrade_ai_decisions 
-                ORDER BY created_at DESC 
-                LIMIT ?
-                ''', (limit,))
-                return cursor.fetchall()
+            data = {
+                'status': status,
+                'updated_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_order_history').update(data).eq('order_id', order_id).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logging.error(f"Ошибка обновления статуса ордера: {e}")
+            return None
+    
+    def insert_ai_decision(self, timestamp: str, decision_type: str, decision_data: str,
+                          market_data: str = None, reasoning: str = None, confidence: float = None):
+        """Вставка решений ИИ"""
+        try:
+            data = {
+                'timestamp': timestamp,
+                'decision_type': decision_type,
+                'decision_data': decision_data,
+                'market_data': market_data,
+                'reasoning': reasoning,
+                'confidence': confidence,
+                'created_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_ai_decisions').insert(data).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logging.error(f"Ошибка вставки решения ИИ: {e}")
+            return None
+    
+    def insert_trading_pair(self, symbol: str, base_currency: str, quote_currency: str, is_active: bool = True):
+        """Вставка торговой пары"""
+        try:
+            data = {
+                'symbol': symbol,
+                'base_currency': base_currency,
+                'quote_currency': quote_currency,
+                'is_active': is_active,
+                'last_updated': datetime.now().isoformat(),
+                'created_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_trading_pairs').upsert(data).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logging.error(f"Ошибка вставки торговой пары: {e}")
+            return None
+    
+    def insert_performance_metric(self, timestamp: str, metric_type: str, metric_name: str, 
+                                value: float, metadata: str = None):
+        """Вставка метрики производительности"""
+        try:
+            data = {
+                'timestamp': timestamp,
+                'metric_type': metric_type,
+                'metric_name': metric_name,
+                'value': value,
+                'metadata': metadata,
+                'created_at': datetime.now().isoformat()
+            }
+            result = self.supabase.table('safetrade_performance_metrics').insert(data).execute()
+            return result.data[0] if result.data else None
+        except Exception as e:
+            logging.error(f"Ошибка вставки метрики: {e}")
+            return None
+    
+    def get_ai_decisions(self, limit: int = 10):
+        """Получение последних решений ИИ"""
+        try:
+            result = self.supabase.table('safetrade_ai_decisions').select('*').order('created_at', desc=True).limit(limit).execute()
+            return result.data
         except Exception as e:
             logging.error(f"Ошибка получения решений ИИ: {e}")
             return []
 
 # Инициализация менеджера базы данных
-db_manager = DatabaseManager()
+db_manager = DatabaseManager(supabase)
 
 # --- УЛУЧШЕННЫЙ TELEGRAM BOT С RETRY МЕХАНИЗМОМ ---
 class RobustTeleBot(telebot.TeleBot):
@@ -501,13 +476,16 @@ if TELEGRAM_BOT_TOKEN:
 else:
     logging.warning("SAFETRADE_TELEGRAM_BOT_TOKEN не указан. Telegram бот будет отключен.")
 
-# Инициализируем Supabase только если есть настройки
-supabase: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logging.info("Supabase подключен")
-else:
-    logging.info("Supabase не настроен - используется локальная SQLite база")
+# Инициализируем Supabase (обязательно)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    logging.error("❌ Supabase настройки обязательны!")
+    logging.error("   - SAFETRADE_SUPABASE_URL")
+    logging.error("   - SAFETRADE_SUPABASE_KEY")
+    logging.error("Бот не может работать без Supabase")
+    sys.exit(1)
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+logging.info("✅ Supabase подключен")
 
 # Инициализируем Cerebras только если есть API ключ
 cerebras_client = None
@@ -670,48 +648,32 @@ def get_all_markets():
 def save_markets_to_db(markets):
     """Сохраняет торговые пары в базу данных"""
     try:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            for market in markets:
-                cursor.execute('''
-                INSERT OR REPLACE INTO safetrade_trading_pairs 
-                (symbol, base_currency, quote_currency, is_active, last_updated)
-                VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    market.get('id', ''),
-                    market.get('base_unit', ''),
-                    market.get('quote_currency', ''),
-                    True,
-                    datetime.now().isoformat()
-                ))
-            
-            conn.commit()
+        for market in markets:
+            db_manager.insert_trading_pair(
+                symbol=market.get('id', ''),
+                base_currency=market.get('base_unit', ''),
+                quote_currency=market.get('quote_currency', ''),
+                is_active=True
+            )
+        logging.info(f"Сохранено {len(markets)} торговых пар в Supabase")
     except Exception as e:
         logging.error(f"Ошибка при сохранении торговых пар: {e}")
 
 def get_markets_from_db():
     """Получает торговые пары из базы данных"""
     try:
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-            SELECT symbol, base_currency, quote_currency, is_active
-            FROM safetrade_trading_pairs
-            WHERE is_active = 1
-            ''')
-            
-            markets = []
-            for row in cursor.fetchall():
-                markets.append({
-                    'id': row[0],
-                    'base_unit': row[1],
-                    'quote_unit': row[2],
-                    'active': row[3]
-                })
-            
-            return markets
+        result = db_manager.supabase.table('safetrade_trading_pairs').select('*').eq('is_active', True).execute()
+        
+        markets = []
+        for row in result.data:
+            markets.append({
+                'id': row['symbol'],
+                'base_unit': row['base_currency'],
+                'quote_unit': row['quote_currency'],
+                'active': row['is_active']
+            })
+        
+        return markets
     except Exception as e:
         logging.error(f"Ошибка при получении торговых пар из БД: {e}")
         return []
@@ -786,7 +748,7 @@ def get_ticker_price(symbol):
             prices_cache["last_update"] = time.time()
         
         # Сохраняем в базу данных
-        db_manager.save_price_data(
+        db_manager.insert_price_history(
             symbol=symbol.upper(),
             price=price,
             volume=float(ticker.get('vol', 0)) if ticker.get('vol') else None,
@@ -1061,10 +1023,11 @@ def get_ai_trading_decision(currency, balance, market_data):
                 )
                 
                 # Сохраняем решение ИИ
-                db_manager.save_ai_decision(
+                db_manager.insert_ai_decision(
+                    timestamp=datetime.now().isoformat(),
                     decision_type="trading_strategy",
-                    decision_data=decision,
-                    market_data=market_data.to_dict(),
+                    decision_data=json.dumps(decision),
+                    market_data=json.dumps(market_data.to_dict()),
                     reasoning=trading_decision.reasoning,
                     confidence=trading_decision.confidence
                 )
@@ -1326,7 +1289,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
         order_amount = order_details.get('amount', amount)
         
         # Сохраняем данные об ордере в локальную базу
-        db_manager.save_order_data(
+        db_manager.insert_order_history(
             order_id=order_id,
             timestamp=datetime.now().isoformat(),
             symbol=order_details.get('market', 'N/A'),
@@ -1375,15 +1338,8 @@ def track_order_execution(order_id, timeout=300):
             if trades:
                 # Обновляем статус ордера в базе данных
                 total_executed = sum(float(t.get('total', 0)) for t in trades)
-                db_manager.save_order_data(
+                db_manager.update_order_status(
                     order_id=order_id,
-                    timestamp=datetime.now().isoformat(),
-                    symbol="N/A",
-                    side="sell",
-                    order_type="N/A",
-                    amount=0,
-                    price=0,
-                    total=total_executed,
                     status="filled"
                 )
                 return trades
@@ -1406,15 +1362,8 @@ def cancel_order(order_id):
         logging.info(f"Ордер {order_id} отменён")
         
         # Обновляем статус в базе данных
-        db_manager.save_order_data(
+        db_manager.update_order_status(
             order_id=order_id,
-            timestamp=datetime.now().isoformat(),
-            symbol="N/A",
-            side="sell",
-            order_type="N/A",
-            amount=0,
-            price=0,
-            total=0,
             status="cancelled"
         )
         return True
@@ -1750,45 +1699,47 @@ if bot:
     def show_history(message):
         """Показывает историю последних сделок"""
         try:
-            with db_manager.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                SELECT order_id, timestamp, symbol, side, order_type, amount, price, total, status
-                FROM safetrade_order_history
-                ORDER BY created_at DESC
-                LIMIT 10
-                ''')
+            result = db_manager.supabase.table('safetrade_order_history').select('*').order('created_at', desc=True).limit(10).execute()
+            
+            orders = result.data
+            
+            if not orders:
+                bot.reply_to(message, "📊 История сделок пуста")
+                return
+            
+            response = "📈 **История последних сделок:**\n\n"
+            
+            for order in orders:
+                order_id = order['order_id']
+                timestamp = order['timestamp']
+                symbol = order['symbol']
+                side = order['side']
+                order_type = order['order_type']
+                amount = order['amount']
+                price = order['price']
+                total = order['total']
+                status = order['status']
                 
-                orders = cursor.fetchall()
+                dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
                 
-                if not orders:
-                    bot.reply_to(message, "📊 История сделок пуста")
-                    return
+                status_emoji = {
+                    'filled': '✅',
+                    'cancelled': '❌',
+                    'pending': '⏳',
+                    'partial': '🔄'
+                }.get(status.lower(), '❓')
                 
-                response = "📈 **История последних сделок:**\n\n"
-                
-                for order in orders:
-                    order_id, timestamp, symbol, side, order_type, amount, price, total, status = order
-                    dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
-                    
-                    status_emoji = {
-                        'filled': '✅',
-                        'cancelled': '❌',
-                        'pending': '⏳',
-                        'partial': '🔄'
-                    }.get(status.lower(), '❓')
-                    
-                    response += (
-                        f"{status_emoji} **{symbol.upper()}**\n"
-                        f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
-                        f"   • Количество: `{amount:.8f}`\n"
-                        f"   • Цена: `{price:.6f}` (если есть)\n"
-                        f"   • Итого: `{total:.6f}` USDT\n"
-                        f"   • Время: `{dt}`\n"
-                        f"   • ID: `{order_id[:8]}...`\n\n"
-                    )
-                
-                bot.reply_to(message, response, parse_mode='Markdown')
+                response += (
+                    f"{status_emoji} **{symbol.upper()}**\n"
+                    f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
+                    f"   • Количество: `{amount:.8f}`\n"
+                    f"   • Цена: `{price:.6f}` (если есть)\n"
+                    f"   • Итого: `{total:.6f}` USDT\n"
+                    f"   • Время: `{dt}`\n"
+                    f"   • ID: `{order_id[:8]}...`\n\n"
+                )
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
         
         except Exception as e:
             logging.error(f"Ошибка в show_history: {e}")
@@ -1803,7 +1754,7 @@ if bot:
                 return
             
             # Получаем последние решения ИИ
-            recent_decisions = db_manager.get_recent_ai_decisions(5)
+            recent_decisions = db_manager.get_ai_decisions(5)
             
             response = "🧠 **Статус ИИ-помощника:**\n\n"
             response += f"✅ **Состояние:** Активен\n"
@@ -2016,6 +1967,16 @@ def main():
             return
         
         logging.info("✅ API ключи SafeTrade настроены")
+        
+        # Проверяем обязательные настройки Supabase
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            logging.error("❌ Отсутствуют обязательные настройки Supabase:")
+            logging.error("   - SAFETRADE_SUPABASE_URL")
+            logging.error("   - SAFETRADE_SUPABASE_KEY")
+            logging.error("Бот не может работать без Supabase")
+            return
+        
+        logging.info("✅ Supabase настройки проверены")
         
         # Загружаем состояние кэша
         load_cache_state()
