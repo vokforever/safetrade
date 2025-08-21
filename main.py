@@ -2378,6 +2378,12 @@ if bot:
                 api_orders = get_safetrade_order_history()
                 
                 if api_orders:
+                    # Логируем структуру полученных данных для отладки
+                    logging.info(f"Получены ордера из API: {len(api_orders)} штук")
+                    if api_orders:
+                        sample_order = api_orders[0]
+                        logging.info(f"Пример структуры ордера: {json.dumps(sample_order, indent=2)}")
+                    
                     # Сохраняем полученные ордера в локальную базу
                     for order in api_orders:
                         try:
@@ -2394,6 +2400,7 @@ if bot:
                             )
                         except Exception as e:
                             logging.error(f"Ошибка сохранения ордера из API: {e}")
+                            logging.error(f"Проблемный ордер: {order}")
                     
                     # Теперь показываем обновленную историю
                     result = db_manager.supabase.table('safetrade_order_history').select('*').order('created_at', desc=True).limit(10).execute()
@@ -2411,33 +2418,48 @@ if bot:
             response = "📈 **История последних сделок:**\n\n"
             
             for order in orders:
-                order_id = order['order_id']
-                timestamp = order['timestamp']
-                symbol = order['symbol']
-                side = order['side']
-                order_type = order['order_type']
-                amount = order['amount']
-                price = order['price']
-                total = order['total']
-                status = order['status']
+                order_id = order.get('order_id', 'N/A')
+                timestamp = order.get('timestamp', '')
+                symbol = order.get('symbol', 'N/A')
+                side = order.get('side', 'N/A')
+                order_type = order.get('order_type', 'N/A')
+                amount = order.get('amount', 0)
+                price = order.get('price', 0)
+                total = order.get('total', 0)
+                status = order.get('status', 'N/A')
                 
-                dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
+                # Безопасное форматирование времени
+                try:
+                    if timestamp:
+                        dt = datetime.fromisoformat(timestamp).strftime('%d.%m.%Y %H:%M')
+                    else:
+                        dt = 'N/A'
+                except:
+                    dt = 'N/A'
                 
                 status_emoji = {
                     'filled': '✅',
                     'cancelled': '❌',
                     'pending': '⏳',
                     'partial': '🔄'
-                }.get(status.lower(), '❓')
+                }.get(str(status).lower(), '❓')
+                
+                # Безопасное форматирование числовых значений
+                amount_str = f"{float(amount):.8f}" if amount is not None else "N/A"
+                price_str = f"{float(price):.6f}" if price is not None else "N/A"
+                total_str = f"{float(total):.6f}" if total is not None else "N/A"
+                
+                # Безопасное форматирование ID
+                order_id_display = f"{order_id[:8]}..." if order_id and len(str(order_id)) > 8 else str(order_id) if order_id else "N/A"
                 
                 response += (
-                    f"{status_emoji} **{symbol.upper()}**\n"
-                    f"   • Тип: {order_type.capitalize()} {side.capitalize()}\n"
-                    f"   • Количество: `{amount:.8f}`\n"
-                    f"   • Цена: `{price:.6f}` (если есть)\n"
-                    f"   • Итого: `{total:.6f}` USDT\n"
+                    f"{status_emoji} **{str(symbol).upper()}**\n"
+                    f"   • Тип: {str(order_type).capitalize()} {str(side).capitalize()}\n"
+                    f"   • Количество: `{amount_str}`\n"
+                    f"   • Цена: `{price_str}`\n"
+                    f"   • Итого: `{total_str}` USDT\n"
                     f"   • Время: `{dt}`\n"
-                    f"   • ID: `{order_id[:8]}...`\n\n"
+                    f"   • ID: `{order_id_display}`\n\n"
                 )
             
             bot.reply_to(message, response, parse_mode='Markdown')
@@ -2826,6 +2848,8 @@ def get_safetrade_order_history():
                 
                 if response.status_code == 200:
                     data = response.json()
+                    logging.info(f"Ответ от {endpoint}: {json.dumps(data, indent=2)[:500]}...")
+                    
                     if isinstance(data, list) and len(data) > 0:
                         logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(data)} ордеров")
                         return data
@@ -2835,6 +2859,20 @@ def get_safetrade_order_history():
                         if isinstance(orders, list) and len(orders) > 0:
                             logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
                             return orders
+                    elif isinstance(data, dict) and data.get('orders'):
+                        # Альтернативное поле для ордеров
+                        orders = data['orders']
+                        if isinstance(orders, list) and len(orders) > 0:
+                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
+                            return orders
+                    elif isinstance(data, dict) and data.get('result'):
+                        # Еще одно возможное поле
+                        orders = data['result']
+                        if isinstance(orders, list) and len(orders) > 0:
+                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
+                            return orders
+                    else:
+                        logging.warning(f"Неожиданная структура ответа от {endpoint}: {type(data)}")
                 else:
                     logging.warning(f"Эндпоинт {endpoint} вернул статус {response.status_code}")
                     
