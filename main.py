@@ -2520,60 +2520,38 @@ if bot:
 
     @bot.message_handler(commands=['history'])
     def show_history(message):
-        """Показывает историю последних сделок с использованием улучшенного TradeHistory"""
+        """Показывает историю последних сделок с использованием улучшенного форматирования"""
         try:
-            # Инициализируем TradeHistory клиент
-            trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
-            
-            # Получаем отформатированную историю сделок
             bot.reply_to(message, "📊 Получаю историю сделок из SafeTrade API...")
             
-            # Пробуем получить историю сделок
-            formatted_history = trade_history_client.get_trade_history(limit=10)
+            # Используем существующую функцию get_safetrade_order_history
+            api_orders = get_safetrade_order_history()
             
-            if formatted_history and "❌ Нет данных" not in formatted_history:
-                # Успешно получили историю
-                response = "📈 **История последних сделок:**\n\n"
-                response += formatted_history
+            if api_orders:
+                # Инициализируем TradeHistory клиент только для форматирования
+                trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
                 
-                # Отправляем ответ
-                bot.reply_to(message, response, parse_mode='Markdown')
+                # Используем TradeHistory для форматирования полученных данных
+                formatted_history = trade_history_client.format_trade_history(api_orders)
                 
-                # Сохраняем полученные данные в базу для кэширования
-                try:
-                    save_trade_history_to_db(trade_history_client)
-                except Exception as e:
-                    logging.warning(f"Не удалось сохранить историю сделок в БД: {e}")
-                
-            else:
-                # Не удалось получить историю через TradeHistory, пробуем альтернативные методы
-                bot.reply_to(message, "🔄 Пробую альтернативные методы получения истории...")
-                
-                # Пробуем получить через основной API
-                api_orders = get_safetrade_order_history()
-                
-                if api_orders:
-                    # Используем TradeHistory для форматирования полученных данных
-                    formatted_history = trade_history_client.format_trade_history(api_orders)
+                if formatted_history and "❌ Нет данных" not in formatted_history:
+                    response = "📈 **История последних сделок:**\n\n"
+                    response += formatted_history
+                    bot.reply_to(message, response, parse_mode='Markdown')
                     
-                    if formatted_history and "❌ Нет данных" not in formatted_history:
-                        response = "📈 **История последних сделок (альтернативный метод):**\n\n"
-                        response += formatted_history
-                        bot.reply_to(message, response, parse_mode='Markdown')
-                    else:
-                        bot.reply_to(message, "❌ Не удалось получить историю сделок ни одним из методов")
+                    # Сохраняем полученные данные в базу для кэширования
+                    try:
+                        save_trade_history_to_db(trade_history_client)
+                    except Exception as e:
+                        logging.warning(f"Не удалось сохранить историю сделок в БД: {e}")
                 else:
-                    bot.reply_to(message, "❌ Не удалось получить историю сделок из SafeTrade API")
+                    bot.reply_to(message, "❌ Не удалось отформатировать данные о сделках")
+            else:
+                bot.reply_to(message, "❌ Не удалось получить историю сделок из SafeTrade API")
                     
         except Exception as e:
             logging.error(f"Ошибка при получении истории сделок: {e}")
             bot.reply_to(message, f"❌ Ошибка при получении истории сделок: {str(e)}")
-            
-            bot.reply_to(message, response, parse_mode='Markdown')
-        
-        except Exception as e:
-            logging.error(f"Ошибка в show_history: {e}")
-            bot.reply_to(message, f"❌ Ошибка получения истории: {e}")
 
     @bot.message_handler(commands=['ai_status'])
     def show_ai_status(message):

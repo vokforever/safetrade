@@ -1,4 +1,4 @@
-import requests
+import cloudscraper
 from datetime import datetime
 import pytz
 import hmac
@@ -13,6 +13,8 @@ class Client:
     self.key = key
     self.secret = secret
     self.headers = {}
+    # Initialize cloudscraper to bypass Cloudflare protection
+    self.scraper = cloudscraper.create_scraper()
 
   def get_authentication(self):
     nonce = str(int(time.time()) * 1000)  # Nonce in milliseconds
@@ -34,7 +36,7 @@ class Client:
         if query:
             logging.debug(f"Query parameters: {query}")
         
-        response = requests.get(self.baseURL + url, headers=auth_headers, params=query, timeout=30)
+        response = self.scraper.get(self.baseURL + url, headers=auth_headers, params=query, timeout=30)
         
         logging.debug(f"Response status: {response.status_code}")
         logging.debug(f"Response headers: {dict(response.headers)}")
@@ -55,11 +57,8 @@ class Client:
         else:
             logging.warning(f"API request failed with status {response.status_code}: {response.text}")
             return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Connection error: {e}")
-        return None
     except Exception as e:
-        logging.error(f"Unexpected error in get_api: {e}")
+        logging.error(f"Connection error: {e}")
         return None
 
   def post_api(self, url, data=None, headers=None):
@@ -72,7 +71,7 @@ class Client:
         if data:
             logging.debug(f"POST data: {data}")
         
-        response = requests.post(self.baseURL + url, headers=auth_headers, json=data, timeout=30)
+        response = self.scraper.post(self.baseURL + url, headers=auth_headers, json=data, timeout=30)
         
         logging.debug(f"Response status: {response.status_code}")
         
@@ -85,23 +84,16 @@ class Client:
         else:
             logging.warning(f"API request failed with status {response.status_code}: {response.text}")
             return None
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Connection error: {e}")
-        return None
     except Exception as e:
-        logging.error(f"Unexpected error in post_api: {e}")
+        logging.error(f"Connection error: {e}")
         return None
 
   def generate_signature(self, nonce, key, secret):
-    hash = hmac.new(secret.encode(), digestmod=hashlib.sha256)
-    # Concatenate nonce and key, then calculate the HMAC hash
-    hash.update((nonce + key).encode())
-    signature = hash.digest()
-
-    # Convert the binary signature to hexadecimal representation
-    signature_hex = binascii.hexlify(signature).decode()
-
-    return signature_hex
+    # Use the same signature generation as main.py
+    # Convert secret to bytes if it's not already
+    secret_bytes = secret.encode('utf-8') if isinstance(secret, str) else secret
+    string_to_sign = nonce + key
+    return hmac.new(secret_bytes, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
 
   def get_orders(self, state=None, limit=100, offset=0):
     """Get orders with optional state filtering"""

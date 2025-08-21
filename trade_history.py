@@ -6,6 +6,7 @@ import logging
 class TradeHistory:
     def __init__(self, baseURL, key, secret):
         self.client = api.Client(baseURL, key, secret)
+        logging.info("TradeHistory client initialized with cloudscraper support")
     
     def format_trade_history(self, trades_data):
         """
@@ -38,13 +39,21 @@ class TradeHistory:
         
         for trade in trades:
             try:
-                # Extract trade information with enhanced field mapping
+                # Extract trade information with SafeTrade API field mapping
                 market = trade.get('market', trade.get('symbol', 'N/A'))
                 side = trade.get('side', trade.get('type', 'N/A'))
-                amount = trade.get('amount', trade.get('volume', '0.00000000'))
-                price = trade.get('price', trade.get('executed_price', 'N/A'))
+                
+                # SafeTrade uses filled_amount for executed amount, origin_amount for original
+                amount = trade.get('filled_amount', trade.get('amount', trade.get('volume', '0.00000000')))
+                
+                # SafeTrade uses avg_price for executed price, price for limit price
+                price = trade.get('avg_price', trade.get('price', trade.get('executed_price', 'N/A')))
+                
+                # For SafeTrade, we usually need to calculate total from avg_price * filled_amount
                 total = trade.get('total', trade.get('executed_volume', 'N/A'))
-                executed_at = trade.get('executed_at', trade.get('created_at', trade.get('timestamp', 'N/A')))
+                
+                # SafeTrade uses triggered_at for execution time, created_at for order creation
+                executed_at = trade.get('triggered_at', trade.get('executed_at', trade.get('created_at', trade.get('timestamp', 'N/A'))))
                 trade_id = trade.get('id', trade.get('trade_id', 'N/A'))
                 
                 # Convert amount to float for calculations
@@ -54,8 +63,9 @@ class TradeHistory:
                     amount_float = 0
                 
                 # Calculate total if not provided or if it's 0
+                # SafeTrade often doesn't provide total, so we calculate it from avg_price * filled_amount
                 if (price != 'N/A' and amount_float > 0 and 
-                    (total == 'N/A' or total == 0 or total == '0.00000000')):
+                    (total == 'N/A' or total == 0 or total == '0.00000000' or str(total) == '0')):
                     try:
                         price_float = float(price)
                         calculated_total = price_float * amount_float
@@ -64,6 +74,14 @@ class TradeHistory:
                     except (ValueError, TypeError) as e:
                         logging.warning(f"Could not calculate total for {market}: {e}")
                         total = 'N/A'
+                
+                # If we still have total as a string number, convert it to proper format
+                if total != 'N/A':
+                    try:
+                        total_float = float(total)
+                        total = f"{total_float:.8f}"
+                    except (ValueError, TypeError):
+                        pass
                 
                 # Format timestamp
                 if executed_at != 'N/A':
@@ -86,15 +104,22 @@ class TradeHistory:
                         logging.warning(f"Could not parse timestamp {executed_at}: {e}")
                         executed_at = str(executed_at)
                 
-                # Determine status icon based on amount and side
-                if amount_float == 0:
-                    status_icon = "❓"
-                elif side.lower() == 'sell':
-                    status_icon = "❌"
-                elif side.lower() == 'buy':
-                    status_icon = "✅"
+                # Determine status icon based on trade state and side
+                trade_state = trade.get('state', 'unknown').lower()
+                if trade_state == 'done' and amount_float > 0:
+                    # Completed trade
+                    if side.lower() == 'sell':
+                        status_icon = "❌"  # Red for sell
+                    elif side.lower() == 'buy':
+                        status_icon = "✅"  # Green for buy
+                    else:
+                        status_icon = "✅"  # Default green for completed
+                elif trade_state in ['cancelled', 'cancel']:
+                    status_icon = "⚠️"  # Warning for cancelled
+                elif amount_float == 0 or trade_state in ['wait', 'pending']:
+                    status_icon = "❓"  # Question for pending/zero amount
                 else:
-                    status_icon = "❓"
+                    status_icon = "❓"  # Default question mark
                 
                 # Format the trade entry
                 trade_entry = f"{status_icon} {market.upper()}\n"
