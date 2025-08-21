@@ -408,8 +408,13 @@ class DatabaseManager:
             return result.data[0] if result.data else None
         except Exception as e:
             # Улучшенная обработка ошибок дублирования
-            if 'duplicate key' in str(e).lower() or '23505' in str(e):
+            error_str = str(e).lower()
+            if ('duplicate key' in error_str or '23505' in error_str or 
+                'unique constraint' in error_str or 'already exists' in error_str):
                 logging.debug(f"Торговая пара {symbol} уже существует, пропускаем")
+                return None
+            elif 'connection' in error_str or 'timeout' in error_str:
+                logging.error(f"Ошибка соединения при вставке {symbol}: {e}")
                 return None
             else:
                 logging.error(f"Ошибка вставки торговой пары {symbol}: {e}")
@@ -488,7 +493,7 @@ class DatabaseManager:
                 return False
     
     def force_cleanup_duplicates(self):
-        """Принудительная очистка дубликатов с пересозданием таблицы"""
+        """Принудительная очистка дубликатов с безопасным подходом"""
         try:
             logging.info("Начинаем принудительную очистку дубликатов...")
             
@@ -508,22 +513,23 @@ class DatabaseManager:
             
             logging.info(f"Найдено {len(result.data)} записей, уникальных: {len(unique_records)}")
             
-            # Очищаем таблицу
-            self.supabase.table('safetrade_trading_pairs').delete().neq('id', '').execute()
-            logging.info("Таблица очищена")
+            # Безопасная очистка - удаляем только дубликаты, сохраняя уникальные
+            all_symbols = [row['symbol'] for row in result.data]
+            duplicate_symbols = [symbol for symbol in all_symbols if all_symbols.count(symbol) > 1]
             
-            # Вставляем уникальные записи
-            for record in unique_records.values():
-                # Убираем id для создания нового
-                record_copy = record.copy()
-                if 'id' in record_copy:
-                    del record_copy['id']
-                if 'created_at' in record_copy:
-                    del record_copy['created_at']
-                
-                self.supabase.table('safetrade_trading_pairs').insert(record_copy).execute()
+            if duplicate_symbols:
+                # Удаляем дубликаты по одному символу
+                for symbol in set(duplicate_symbols):
+                    # Оставляем первую запись, удаляем остальные
+                    symbol_records = [row for row in result.data if row['symbol'] == symbol]
+                    if len(symbol_records) > 1:
+                        # Удаляем все кроме первой
+                        for record in symbol_records[1:]:
+                            if 'id' in record:
+                                self.supabase.table('safetrade_trading_pairs').delete().eq('id', record['id']).execute()
+                                logging.debug(f"Удален дубликат {symbol} с ID {record['id']}")
             
-            logging.info(f"Восстановлено {len(unique_records)} уникальных записей")
+            logging.info(f"Очистка завершена. Сохранено {len(unique_records)} уникальных записей")
             return True
             
         except Exception as e:
@@ -585,6 +591,11 @@ class DatabaseManager:
     def check_database_health(self):
         """Проверка здоровья базы данных и автоматическая очистка при необходимости"""
         try:
+            # Сначала проверяем соединение с базой
+            if not self.check_connection():
+                logging.error("Нет соединения с базой данных")
+                return False
+            
             total_count = self.get_trading_pairs_count()
             duplicate_count = self.get_duplicate_count()
             
@@ -610,6 +621,80 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка при проверке здоровья БД: {e}")
             return False
+    
+    def check_connection(self):
+        """Проверка соединения с Supabase"""
+        try:
+            # Простой тест соединения
+            result = self.supabase.table('safetrade_trading_pairs').select('symbol').limit(1).execute()
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка соединения с Supabase: {e}")
+            return False
+    
+    def execute_with_retry(self, operation, max_retries=3, delay=1):
+        """Выполнение операции с повторными попытками"""
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise e
+                logging.warning(f"Попытка {attempt + 1} не удалась: {e}. Повтор через {delay} сек...")
+                time.sleep(delay)
+                delay *= 2  # Экспоненциальная задержка
+    
+    def get_database_stats(self):
+        """Получение статистики базы данных для мониторинга"""
+        try:
+            stats = {
+                'trading_pairs': self.get_trading_pairs_count(),
+                'price_history': 0,
+                'order_history': 0,
+                'ai_decisions': 0,
+                'performance_metrics': 0,
+                'duplicates': self.get_duplicate_count(),
+                'connection_healthy': self.check_connection()
+            }
+            
+            # Получаем количество записей в других таблицах
+            try:
+                result = self.supabase.table('safetrade_price_history').select('*', count='exact').execute()
+                stats['price_history'] = result.count if hasattr(result, 'count') else len(result.data or [])
+            except:
+                pass
+                
+            try:
+                result = self.supabase.table('safetrade_order_history').select('*', count='exact').execute()
+                stats['order_history'] = result.count if hasattr(result, 'count') else len(result.data or [])
+            except:
+                pass
+                
+            try:
+                result = self.supabase.table('safetrade_ai_decisions').select('*', count='exact').execute()
+                stats['ai_decisions'] = result.count if hasattr(result, 'count') else len(result.data or [])
+            except:
+                pass
+                
+            try:
+                result = self.supabase.table('safetrade_performance_metrics').select('*', count='exact').execute()
+                stats['performance_metrics'] = result.count if hasattr(result, 'count') else len(result.data or [])
+            except:
+                pass
+            
+            return stats
+        except Exception as e:
+            logging.error(f"Ошибка получения статистики БД: {e}")
+            return None
+    
+    def close_connection(self):
+        """Безопасное закрытие соединения с базой данных"""
+        try:
+            if hasattr(self.supabase, 'auth') and hasattr(self.supabase.auth, 'sign_out'):
+                self.supabase.auth.sign_out()
+                logging.info("Соединение с Supabase закрыто")
+        except Exception as e:
+            logging.warning(f"Ошибка при закрытии соединения: {e}")
 
 # Инициализация менеджера базы данных будет выполнена после создания Supabase клиента
 
@@ -664,7 +749,16 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     sys.exit(1)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-logging.info("✅ Supabase подключен")
+
+# Тестируем соединение с Supabase
+try:
+    # Простой тест соединения
+    test_result = supabase.table('safetrade_trading_pairs').select('symbol').limit(1).execute()
+    logging.info("✅ Supabase подключен и соединение протестировано")
+except Exception as e:
+    logging.error(f"❌ Ошибка подключения к Supabase: {e}")
+    logging.error("Проверьте URL, ключ и доступность сервера")
+    sys.exit(1)
 
 # Инициализация менеджера базы данных
 db_manager = DatabaseManager(supabase)
@@ -724,6 +818,19 @@ def shutdown_handler(signum, frame):
         cancel_all_active_orders()
         # Сохраняем состояние кэша
         save_cache_state()
+        # Правильное завершение Supabase клиента
+        if 'db_manager' in globals():
+            try:
+                db_manager.close_connection()
+            except Exception as e:
+                logging.warning(f"Ошибка при завершении менеджера БД: {e}")
+        
+        if 'supabase' in globals():
+            try:
+                supabase.auth.sign_out()
+                logging.info("Supabase клиент корректно завершен")
+            except Exception as e:
+                logging.warning(f"Ошибка при завершении Supabase клиента: {e}")
     except Exception as e:
         logging.error(f"Ошибка при завершении: {e}")
     sys.exit(0)
@@ -896,6 +1003,7 @@ def get_all_markets():
 
 def save_markets_to_db(markets):
     """Сохраняет торговые пары в базу данных с улучшенной обработкой дубликатов"""
+    global db_manager
     try:
         saved_count = 0
         skipped_count = 0
@@ -977,6 +1085,7 @@ def save_markets_to_db(markets):
 
 def get_markets_from_db():
     """Получает торговые пары из базы данных"""
+    global db_manager
     try:
         result = db_manager.supabase.table('safetrade_trading_pairs').select('*').eq('is_active', True).execute()
         
@@ -1058,7 +1167,7 @@ def get_sellable_balances():
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_ticker_price(symbol):
     """Получает текущую цену для указанной торговой пары"""
-    global prices_cache
+    global prices_cache, db_manager
     
     # Нормализуем символ (приводим к нижнему регистру)
     symbol = symbol.lower()
@@ -1393,6 +1502,7 @@ def prioritize_sales(balances_dict):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_ai_trading_decision(currency, balance, market_data):
     """Получение решения о торговле от ИИ для конкретной валюты"""
+    global db_manager
     if not cerebras_client:
         return None
     
@@ -1720,6 +1830,7 @@ def extract_order_id_from_result(result_text):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
     """Создает ордер на продажу и возвращает отформатированный результат"""
+    global db_manager
     try:
         # Валидация параметров
         order_validator.validate_order_params(market_symbol, amount, order_type, price)
@@ -1787,6 +1898,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def track_order_execution(order_id, timeout=300):
     """Отслеживает исполнение ордера и возвращает trades"""
+    global db_manager
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -1814,6 +1926,7 @@ def track_order_execution(order_id, timeout=300):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def cancel_order(order_id):
     """Отменяет ордер"""
+    global db_manager
     try:
         path = f"/trade/market/orders/{order_id}/cancel"
         url = BASE_URL + path
@@ -2217,6 +2330,7 @@ if bot:
     @bot.message_handler(commands=['history'])
     def show_history(message):
         """Показывает историю последних сделок"""
+        global db_manager
         try:
             result = db_manager.supabase.table('safetrade_order_history').select('*').order('created_at', desc=True).limit(10).execute()
             
@@ -2267,6 +2381,7 @@ if bot:
     @bot.message_handler(commands=['ai_status'])
     def show_ai_status(message):
         """Показывает статус ИИ-помощника"""
+        global db_manager
         try:
             if not cerebras_client:
                 bot.reply_to(message, "❌ ИИ-помощник не настроен (отсутствует CEREBRAS_API_KEY)")
@@ -2507,7 +2622,21 @@ def main():
                 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
                 db_manager = DatabaseManager(supabase)
                 
-                db_manager.check_database_health()
+                # Получаем детальную статистику
+                stats = db_manager.get_database_stats()
+                if stats:
+                    print("\n📊 Статистика базы данных:")
+                    print(f"   • Торговые пары: {stats['trading_pairs']}")
+                    print(f"   • История цен: {stats['price_history']}")
+                    print(f"   • История ордеров: {stats['order_history']}")
+                    print(f"   • Решения ИИ: {stats['ai_decisions']}")
+                    print(f"   • Метрики производительности: {stats['performance_metrics']}")
+                    print(f"   • Дубликаты: {stats['duplicates']}")
+                    print(f"   • Соединение: {'✅' if stats['connection_healthy'] else '❌'}")
+                
+                # Проверяем здоровье
+                health_result = db_manager.check_database_health()
+                print(f"\n🏥 Здоровье БД: {'✅' if health_result else '❌'}")
                 return
             except Exception as e:
                 logging.error(f"❌ Ошибка при проверке здоровья: {e}")
@@ -2548,7 +2677,7 @@ def main():
         
         # Проверяем здоровье базы данных при запуске
         logging.info("🔍 Проверка здоровья базы данных при запуске...")
-        db_manager.manual_cleanup_if_needed()
+        db_manager.check_database_health()
         
         # Загружаем состояние кэша
         load_cache_state()
