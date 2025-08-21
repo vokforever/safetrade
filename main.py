@@ -2373,8 +2373,40 @@ if bot:
             orders = result.data
             
             if not orders:
-                bot.reply_to(message, "📊 История сделок пуста")
-                return
+                # Если локальная база пуста, проверяем SafeTrade API
+                bot.reply_to(message, "📊 История сделок пуста в локальной базе. Проверяю SafeTrade API...")
+                api_orders = get_safetrade_order_history()
+                
+                if api_orders:
+                    # Сохраняем полученные ордера в локальную базу
+                    for order in api_orders:
+                        try:
+                            db_manager.insert_order_history(
+                                order_id=order.get('id', ''),
+                                timestamp=order.get('created_at', datetime.now().isoformat()),
+                                symbol=order.get('market', ''),
+                                side=order.get('side', ''),
+                                order_type=order.get('type', ''),
+                                amount=float(order.get('amount', 0)),
+                                price=float(order.get('price', 0)) if order.get('price') else None,
+                                total=float(order.get('total', 0)) if order.get('total') else None,
+                                status=order.get('state', 'pending')
+                            )
+                        except Exception as e:
+                            logging.error(f"Ошибка сохранения ордера из API: {e}")
+                    
+                    # Теперь показываем обновленную историю
+                    result = db_manager.supabase.table('safetrade_order_history').select('*').order('created_at', desc=True).limit(10).execute()
+                    orders = result.data
+                    
+                    if orders:
+                        bot.reply_to(message, "✅ Получены данные из SafeTrade API и сохранены в локальную базу.")
+                    else:
+                        bot.reply_to(message, "❌ Не удалось получить данные из SafeTrade API")
+                        return
+                else:
+                    bot.reply_to(message, "❌ История сделок пуста как в локальной базе, так и в SafeTrade API")
+                    return
             
             response = "📈 **История последних сделок:**\n\n"
             
@@ -2774,6 +2806,48 @@ def main():
         save_cache_state()
         if bot:  # Проверяем, что бот инициализирован
             cancel_all_active_orders()
+
+def get_safetrade_order_history():
+    """Получает историю ордеров из SafeTrade API"""
+    try:
+        # Пробуем несколько эндпоинтов для получения истории ордеров
+        endpoints = [
+            "/trade/market/orders",
+            "/peatio/market/orders", 
+            "/trade/account/orders",
+            "/peatio/account/orders"
+        ]
+        
+        for endpoint in endpoints:
+            try:
+                url = BASE_URL + endpoint
+                headers = get_auth_headers()
+                response = scraper.get(url, headers=headers, timeout=30)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(data)} ордеров")
+                        return data
+                    elif isinstance(data, dict) and data.get('data'):
+                        # Некоторые API возвращают данные в поле 'data'
+                        orders = data['data']
+                        if isinstance(orders, list) and len(orders) > 0:
+                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
+                            return orders
+                else:
+                    logging.warning(f"Эндпоинт {endpoint} вернул статус {response.status_code}")
+                    
+            except Exception as e:
+                logging.warning(f"Ошибка при запросе к {endpoint}: {e}")
+                continue
+        
+        logging.error("❌ Не удалось получить историю ордеров ни с одного эндпоинта")
+        return None
+        
+    except Exception as e:
+        logging.error(f"❌ Критическая ошибка при получении истории ордеров: {e}")
+        return None
 
 if __name__ == "__main__":
     main()
