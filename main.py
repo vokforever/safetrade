@@ -31,6 +31,8 @@ import yaml
 import socket
 import subprocess
 from urllib.parse import urlparse
+import manager
+import trade_history
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
