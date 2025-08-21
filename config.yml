@@ -1,0 +1,65 @@
+# SafeTrade Bot Configuration
+# Этот файл позволяет настроить поведение бота без изменения кода
+
+trading:
+  # Список валют, которые НЕ будут продаваться (всегда исключены)
+  excluded_currencies: ['USDT', 'BUSD', 'USDC']
+  
+  # Список валют, которые БУДУТ проверяться (пустой список = проверять все)
+  # Если указаны валюты здесь, бот будет проверять ТОЛЬКО их
+  allowed_currencies: ['QTC', 'USDT']
+  
+  # Минимальная стоимость позиции в USD для продажи
+  min_position_value_usd: 1.0
+  
+  # Максимальное количество одновременных продаж
+  max_concurrent_sales: 3
+  
+  # Интервал автоматической продажи в секундах (3600 = 1 час)
+  auto_sell_interval: 3600
+  
+  # Стратегии продаж
+  strategies:
+    twap:
+      default_duration: 60      # Длительность TWAP в секундах
+      default_chunks: 6         # Количество частей для TWAP
+    iceberg:
+      default_visible_ratio: 0.1  # Видимая часть айсберг-ордера
+      max_attempts: 20          # Максимум попыток размещения
+    adaptive:
+      max_price_levels: 10      # Максимум уровней цен
+      liquidity_ratio: 0.1      # Коэффициент ликвидности
+
+risk_management:
+  # Максимальная стоимость позиции в USD
+  max_position_value: 10000
+  
+  # Минимальный спред для торговли
+  min_spread_threshold: 0.001
+  
+  # Максимальный порог волатильности
+  max_volatility_threshold: 0.05
+
+cache:
+  # Длительность кэша рынков в секундах (4 часа)
+  markets_duration: 14400
+  
+  # Длительность кэша цен в секундах (5 минут)
+  prices_duration: 300
+  
+  # Длительность кэша стакана в секундах (1 минута)
+  orderbook_duration: 60
+
+# Примеры конфигурации:
+# 
+# 1. Проверять только QTC и USDT:
+# allowed_currencies: ['QTC', 'USDT']
+#
+# 2. Проверять все валюты (по умолчанию):
+# allowed_currencies: []
+#
+# 3. Проверять только определенные альткоины:
+# allowed_currencies: ['BTC', 'ETH', 'BNB', 'ADA']
+#
+# 4. Исключить больше валют:
+# excluded_currencies: ['USDT', 'BUSD', 'USDC', 'BTC', 'ETH']

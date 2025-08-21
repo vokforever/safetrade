@@ -94,11 +94,17 @@ load_dotenv()
 # - SAFETRADE_WEBHOOK_URL - URL для webhook режима (альтернатива polling)
 # - SAFETRADE_WEBHOOK_PORT - Порт для webhook режима
 #
+# КОНФИГУРАЦИЯ ВАЛЮТ:
+# - excluded_currencies: валюты, которые НЕ будут продаваться (всегда исключены)
+# - allowed_currencies: валюты, которые БУДУТ проверяться (пустой список = проверять все)
+#   Пример: ['QTC', 'USDT'] - проверять только QTC и USDT
+#
 # ПРИМЕЧАНИЕ: Бот будет работать ТОЛЬКО с SAFETRADE_API_KEY и SAFETRADE_API_SECRET!
 # Все остальные функции будут отключены, если соответствующие переменные не указаны.
 DEFAULT_CONFIG = {
     'trading': {
         'excluded_currencies': ['USDT', 'BUSD', 'USDC'],
+        'allowed_currencies': [],  # Пустой список = проверять все валюты, если указаны - только их
         'min_position_value_usd': 1.0,
         'max_concurrent_sales': 3,
         'auto_sell_interval': 3600,
@@ -200,6 +206,7 @@ BASE_URL = "https://safe.trade/api/v2"
 
 # Настройки из конфигурации
 EXCLUDED_CURRENCIES = CONFIG['trading']['excluded_currencies']
+ALLOWED_CURRENCIES = CONFIG['trading']['allowed_currencies']
 MIN_POSITION_VALUE_USD = CONFIG['trading']['min_position_value_usd']
 MAX_CONCURRENT_SALES = CONFIG['trading']['max_concurrent_sales']
 AUTO_SELL_INTERVAL = CONFIG['trading']['auto_sell_interval']
@@ -1158,7 +1165,12 @@ def get_sellable_balances():
         # Получаем доступные торговые пары
         markets = get_all_markets()
         available_currencies = {market.get('base_unit', '').upper() for market in markets}
-        logging.info(f"📊 Доступные валюты в торговых парах: {sorted(list(available_currencies))[:10]}...")
+        
+        if ALLOWED_CURRENCIES:
+            logging.info(f"📊 Проверяем только разрешенные валюты: {ALLOWED_CURRENCIES}")
+            logging.info(f"📊 Доступные валюты в торговых парах: {sorted(list(available_currencies))[:10]}...")
+        else:
+            logging.info(f"📊 Доступные валюты в торговых парах: {sorted(list(available_currencies))[:10]}...")
         
         sellable_balances = {}
         for balance in balances:
@@ -1173,6 +1185,11 @@ def get_sellable_balances():
                     logging.debug(f"⏭️ Пропускаем {currency}: в списке исключенных")
                 else:
                     logging.debug(f"⏭️ Пропускаем {currency}: нулевой баланс")
+                continue
+            
+            # Проверяем allowlist - если настроен, пропускаем валюты не в списке
+            if ALLOWED_CURRENCIES and currency not in ALLOWED_CURRENCIES:
+                logging.info(f"⏭️ Пропускаем {currency}: не в списке разрешенных валют {ALLOWED_CURRENCIES}")
                 continue
             
             # Проверяем, есть ли торговая пара для этой валюты
@@ -2686,6 +2703,10 @@ if bot:
             
             response += "**🔧 Торговые настройки:**\n"
             response += f"• Исключенные валюты: `{', '.join(EXCLUDED_CURRENCIES)}`\n"
+            if ALLOWED_CURRENCIES:
+                response += f"• Разрешенные валюты: `{', '.join(ALLOWED_CURRENCIES)}`\n"
+            else:
+                response += f"• Разрешенные валюты: `Все доступные`\n"
             response += f"• Мин. стоимость позиции: `${MIN_POSITION_VALUE_USD}`\n"
             response += f"• Макс. одновременных продаж: `{MAX_CONCURRENT_SALES}`\n"
             response += f"• Интервал автопродаж: `{AUTO_SELL_INTERVAL}` сек\n\n"
