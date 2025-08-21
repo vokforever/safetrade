@@ -10,7 +10,7 @@ import cloudscraper
 from datetime import datetime, timedelta
 import threading
 from supabase import create_client, Client
-from cerebras.cloud.sdk import Cerebras
+# from cerebras.cloud.sdk import Cerebras  # Temporarily commented out due to pydantic compatibility issues
 import requests
 from pathlib import Path
 import random
@@ -2264,26 +2264,26 @@ if bot:
     @bot.message_handler(commands=['test_api'])
     def test_api_endpoints_cmd(message):
         """Тестирование API эндпоинтов"""
-    if str(message.chat.id) == ADMIN_CHAT_ID:
-        bot.reply_to(message, "🔍 Тестирую API эндпоинты...")
-        
-        def test_thread():
-            try:
-                working_endpoints = test_api_endpoints()
-                if working_endpoints:
-                    response = "✅ **API тест завершен**\n\n🎯 **Работающие эндпоинты:**\n"
-                    for endpoint in working_endpoints:
-                        response += f"• `{endpoint}`\n"
-                else:
-                    response = "❌ **API тест завершен**\n\n🚨 Не найдено ни одного работающего эндпоинта!"
-                
-                bot.send_message(message.chat.id, response, parse_mode='Markdown')
-            except Exception as e:
-                bot.send_message(message.chat.id, f"❌ Ошибка тестирования API: {e}")
-        
-        threading.Thread(target=test_thread).start()
-    else:
-        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+        if str(message.chat.id) == ADMIN_CHAT_ID:
+            bot.reply_to(message, "🔍 Тестирую API эндпоинты...")
+            
+            def test_thread():
+                try:
+                    working_endpoints = test_api_endpoints()
+                    if working_endpoints:
+                        response = "✅ **API тест завершен**\n\n🎯 **Работающие эндпоинты:**\n"
+                        for endpoint in working_endpoints:
+                            response += f"• `{endpoint}`\n"
+                    else:
+                        response = "❌ **API тест завершен**\n\n🚨 Не найдено ни одного работающего эндпоинта!"
+                    
+                    bot.send_message(message.chat.id, response, parse_mode='Markdown')
+                except Exception as e:
+                    bot.send_message(message.chat.id, f"❌ Ошибка тестирования API: {e}")
+            
+            threading.Thread(target=test_thread).start()
+        else:
+            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
     @bot.message_handler(commands=['restart'])
     def restart_bot(message):
@@ -2625,6 +2625,7 @@ def run_trading_mode():
 
 def main():
     """Главная функция запуска"""
+    global db_manager
     # Проверяем аргументы командной строки
     if len(sys.argv) > 1:
         command = sys.argv[1].lower()
@@ -2721,8 +2722,15 @@ def main():
 
         test_api_endpoints()
         
+        # Инициализируем менеджер базы данных
         logging.info("🔍 Проверка здоровья базы данных при запуске...")
-        db_manager.check_database_health()
+        try:
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            db_manager = DatabaseManager(supabase)
+            db_manager.check_database_health()
+        except Exception as e:
+            logging.error(f"❌ Ошибка инициализации базы данных: {e}")
+            return
         
         # Загружаем состояние кэша
         load_cache_state()
