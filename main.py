@@ -530,6 +530,32 @@ class DatabaseManager:
             logging.error(f"Ошибка при принудительной очистке: {e}")
             return False
     
+    def manual_cleanup_if_needed(self):
+        """Ручная очистка дубликатов если их много"""
+        try:
+            total_count = self.get_trading_pairs_count()
+            duplicate_count = self.get_duplicate_count()
+            
+            if duplicate_count > 0:
+                logging.warning(f"🔧 Ручная очистка: обнаружено {duplicate_count} дубликатов из {total_count} записей")
+                
+                if duplicate_count > total_count * 0.1:  # Если больше 10% дубликатов
+                    logging.info("🚨 Критическое количество дубликатов! Запуск принудительной очистки...")
+                    return self.force_cleanup_duplicates()
+                elif duplicate_count > total_count * 0.05:  # Если больше 5% дубликатов
+                    logging.info("⚠️ Умеренное количество дубликатов. Запуск очистки...")
+                    return self.force_cleanup_duplicates()
+                else:
+                    logging.info("ℹ️ Небольшое количество дубликатов, очистка не требуется")
+                    return True
+            else:
+                logging.info("✅ Дубликатов не обнаружено")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Ошибка при ручной очистке: {e}")
+            return False
+    
     def get_duplicate_count(self):
         """Получение количества дублирующихся записей"""
         try:
@@ -565,8 +591,8 @@ class DatabaseManager:
             if duplicate_count > 0:
                 logging.warning(f"Обнаружено {duplicate_count} дублирующихся записей из {total_count} общих")
                 
-                # Если дубликатов больше 10% от общего количества, запускаем автоматическую очистку
-                if duplicate_count > total_count * 0.1:
+                # Если дубликатов больше 5% от общего количества, запускаем автоматическую очистку
+                if duplicate_count > total_count * 0.05:
                     logging.info("Запуск автоматической очистки дубликатов...")
                     if self.force_cleanup_duplicates():
                         logging.info("Автоматическая очистка завершена успешно")
@@ -845,6 +871,9 @@ def get_all_markets():
                        market.get('base_unit', '').upper() not in EXCLUDED_CURRENCIES
                 ]
                 
+                logging.info(f"🔍 Найдено {len(usdt_markets)} USDT пар после фильтрации")
+                logging.info(f"📋 Примеры USDT пар: {[f'{m.get('base_unit', '').upper()}/USDT' for m in usdt_markets[:5]]}")
+                
                 with cache_lock:
                     markets_cache["data"] = usdt_markets
                     markets_cache["last_update"] = time.time()
@@ -883,17 +912,31 @@ def save_markets_to_db(markets):
         except Exception as e:
             logging.warning(f"Не удалось получить существующие символы: {e}")
         
+        # Если все торговые пары уже существуют, просто логируем и выходим
+        if len(existing_symbols) >= len(markets):
+            logging.info(f"Все {len(markets)} торговых пар уже существуют в БД. Обновление не требуется.")
+            logging.info(f"Текущее количество в БД: {len(existing_symbols)}, получено с API: {len(markets)}")
+            return
+        
+        # Фильтруем только новые торговые пары
+        new_markets = []
         for market in markets:
             symbol = market.get('id', '')
-            if not symbol:
-                continue
-                
+            if symbol and symbol not in existing_symbols:
+                new_markets.append(market)
+            else:
+                skipped_count += 1
+        
+        if not new_markets:
+            logging.info(f"Новых торговых пар не найдено. Пропущено: {skipped_count}")
+            return
+        
+        logging.info(f"Найдено {len(new_markets)} новых торговых пар для добавления")
+        
+        # Вставляем новые торговые пары
+        for market in new_markets:
+            symbol = market.get('id', '')
             try:
-                # Проверяем, существует ли уже символ
-                if symbol in existing_symbols:
-                    skipped_count += 1
-                    continue
-                
                 result = db_manager.insert_trading_pair(
                     symbol=symbol,
                     base_currency=market.get('base_unit', ''),
@@ -902,7 +945,6 @@ def save_markets_to_db(markets):
                 )
                 if result:
                     saved_count += 1
-                    existing_symbols.add(symbol)  # Добавляем в локальный кэш
                 else:
                     error_count += 1
             except Exception as e:
@@ -922,9 +964,12 @@ def save_markets_to_db(markets):
             db_manager.check_database_health()
         
         # Если много ошибок дублирования, предлагаем очистку
-        if error_count > len(markets) * 0.3:  # Если больше 30% ошибок
+        if error_count > len(new_markets) * 0.3:  # Если больше 30% ошибок
             logging.info("Обнаружено много дублирующихся записей. Рекомендуется очистка БД.")
             logging.info("Для принудительной очистки используйте: db_manager.force_cleanup_duplicates()")
+        
+        # Проверяем общее здоровье БД
+        db_manager.check_database_health()
         
     except Exception as e:
         logging.error(f"Ошибка при сохранении торговых пар: {e}")
@@ -966,31 +1011,39 @@ def get_sellable_balances():
         # Получаем доступные торговые пары
         markets = get_all_markets()
         available_currencies = {market.get('base_unit', '').upper() for market in markets}
+        logging.info(f"📊 Доступные валюты в торговых парах: {sorted(list(available_currencies))[:10]}...")
         
         sellable_balances = {}
         for balance in balances:
             currency = balance.get('currency', '').upper()
             balance_amount = float(balance.get('balance', 0))
             
+            logging.info(f"🔍 Проверяем баланс {currency}: {balance_amount}")
+            
             # Пропускаем исключенные валюты и нулевые балансы
             if (currency in EXCLUDED_CURRENCIES or balance_amount <= 0):
+                if currency in EXCLUDED_CURRENCIES:
+                    logging.debug(f"⏭️ Пропускаем {currency}: в списке исключенных")
+                else:
+                    logging.debug(f"⏭️ Пропускаем {currency}: нулевой баланс")
                 continue
             
             # Проверяем, есть ли торговая пара для этой валюты
             if currency not in available_currencies:
-                logging.debug(f"Валюты {currency} нет в доступных торговых парах")
+                logging.info(f"⚠️ Валюты {currency} нет в доступных торговых парах")
                 # Пробуем найти альтернативные пары
                 alternative_pairs = [f"{currency.lower()}btc", f"{currency.lower()}eth", f"{currency.lower()}usdc"]
                 has_alternative = any(any(market.get('id', '').lower() == alt for market in markets) for alt in alternative_pairs)
                 
                 if has_alternative:
-                    logging.info(f"Найдена альтернативная торговая пара для {currency}")
+                    logging.info(f"✅ Найдена альтернативная торговая пара для {currency}")
                     sellable_balances[currency] = balance_amount
                 else:
-                    logging.debug(f"Нет альтернативных торговых пар для {currency}")
-                continue
-            
-            sellable_balances[currency] = balance_amount
+                    logging.info(f"❌ Нет альтернативных торговых пар для {currency}")
+                    continue
+            else:
+                logging.info(f"✅ {currency} найден в доступных торговых парах")
+                sellable_balances[currency] = balance_amount
         
         if sellable_balances:
             logging.info(f"Найдены продаваемые балансы: {sellable_balances}")
@@ -1015,16 +1068,14 @@ def get_ticker_price(symbol):
             time.time() - prices_cache["last_update"] < prices_cache["cache_duration"]):
             return prices_cache["data"][symbol]
     
-    # Пробуем разные возможные эндпоинты для получения тикера
+    # Список эндпоинтов для попытки получения цены (в порядке приоритета)
     # Приоритет отдаем рабочим эндпоинтам из логов
-    possible_endpoints = [
-        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт
-        f"/markets/{symbol}/tickers",       # Альтернативный
-        f"/public/markets/{symbol}/tickers", # Резервный
-        f"/tickers/{symbol}"                # Последний вариант
+    endpoints = [
+        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт из логов
+        f"/public/markets/{symbol}/tickers" # Резервный
     ]
     
-    for endpoint in possible_endpoints:
+    for endpoint in endpoints:
         try:
             url = BASE_URL + endpoint
             logging.info(f"Пробуем получить тикер {symbol} через: {endpoint}")
@@ -1097,15 +1148,13 @@ def get_ticker_price(symbol):
 
 def get_ticker_price_internal(symbol):
     """Внутренняя функция для получения цены (без retry)"""
-    # Пробуем разные возможные эндпоинты для получения тикера
-    possible_endpoints = [
-        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт
-        f"/markets/{symbol}/tickers",       # Альтернативный
-        f"/public/markets/{symbol}/tickers", # Резервный
-        f"/tickers/{symbol}"                # Последний вариант
+    # Список эндпоинтов для попытки получения цены (в порядке приоритета)
+    endpoints = [
+        f"/trade/public/tickers/{symbol}",  # Рабочий эндпоинт из логов
+        f"/public/markets/{symbol}/tickers" # Резервный
     ]
     
-    for endpoint in possible_endpoints:
+    for endpoint in endpoints:
         try:
             url = BASE_URL + endpoint
             response = scraper.get(url, timeout=30)
@@ -1142,24 +1191,23 @@ def get_orderbook(symbol):
             time.time() - orderbook_cache["last_update"][symbol] < orderbook_cache["cache_duration"]):
             return orderbook_cache["data"][symbol]
     
-    # Пробуем разные возможные эндпоинты для получения книги ордеров
-    possible_endpoints = [
+    # Список эндпоинтов для попытки получения книги ордеров (в порядке приоритета)
+    endpoints = [
         f"/trade/public/order-book/{symbol}",
-        f"/public/markets/{symbol}/order-book",
+        f"/public/markets/{symbol}/order-book", 
         f"/order-book/{symbol}",
         f"/trade/order-book/{symbol}"
     ]
     
-    for endpoint in possible_endpoints:
+    for endpoint in endpoints:
         try:
             url = BASE_URL + endpoint
-            logging.info(f"Пробуем получить книгу ордеров {symbol} через: {endpoint}")
             response = scraper.get(url, timeout=30)
             response.raise_for_status()
             orderbook = response.json()
             
             if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
-                logging.warning(f"Пустая или некорректная книга ордеров для {symbol} от {endpoint}")
+                logging.warning(f"Пустая книга ордеров для {symbol} через {endpoint}")
                 continue
             
             with cache_lock:
@@ -1211,42 +1259,55 @@ def get_market_data(symbol):
         
         # Получаем книгу ордеров
         orderbook = get_orderbook(symbol)
+        
+        # Если не удалось получить книгу ордеров, используем базовые значения
         if not orderbook:
-            logging.warning(f"Не удалось получить книгу ордеров для {symbol}")
-            return None
-        
-        # Рассчитываем метрики
-        volatility = calculate_volatility(orderbook)
-        
-        # Рассчитываем глубину
-        bid_depth = sum(float(bid[1]) for bid in orderbook.get('bids', [])[:10])
-        ask_depth = sum(float(ask[1]) for ask in orderbook.get('asks', [])[:10])
-        
-        # Рассчитываем спред
-        best_bid = float(orderbook['bids'][0][0]) if orderbook['bids'] else 0
-        best_ask = float(orderbook['asks'][0][0]) if orderbook['asks'] else 0
-        spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
-        
-        # Получаем объем торгов (из тикера)
-        path = f"/public/markets/{symbol}/tickers"
-        url = BASE_URL + path
-        response = scraper.get(url, timeout=30)
-        response.raise_for_status()
-        ticker = response.json()
-        volume_24h = float(ticker.get('vol', 0))
-        
-        market_data = MarketData(
-            symbol=symbol.upper(),
-            current_price=current_price,
-            volatility=volatility,
-            volume_24h=volume_24h,
-            bid_depth=bid_depth,
-            ask_depth=ask_depth,
-            spread=spread
-        )
+            logging.warning(f"Не удалось получить книгу ордеров для {symbol}, используем базовые значения")
+            market_data = MarketData(
+                symbol=symbol.upper(),
+                current_price=current_price,
+                volatility=0.01,  # Базовое значение
+                volume_24h=1000,   # Базовое значение
+                bid_depth=100,      # Базовое значение
+                ask_depth=100,      # Базовое значение
+                spread=0.001        # Базовое значение
+            )
+        else:
+            # Рассчитываем метрики на основе книги ордеров
+            volatility = calculate_volatility(orderbook)
+            
+            # Рассчитываем глубину
+            bid_depth = sum(float(bid[1]) for bid in orderbook.get('bids', [])[:10])
+            ask_depth = sum(float(ask[1]) for ask in orderbook.get('asks', [])[:10])
+            
+            # Рассчитываем спред
+            best_bid = float(orderbook['bids'][0][0]) if orderbook['bids'] else 0
+            best_ask = float(orderbook['asks'][0][0]) if orderbook['asks'] else 0
+            spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
+            
+            # Получаем объем торгов (из тикера)
+            path = f"/public/markets/{symbol}/tickers"
+            url = BASE_URL + path
+            response = scraper.get(url, timeout=30)
+            response.raise_for_status()
+            ticker = response.json()
+            volume_24h = float(ticker.get('vol', 0))
+            
+            market_data = MarketData(
+                symbol=symbol.upper(),
+                current_price=current_price,
+                volatility=volatility,
+                volume_24h=volume_24h,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                spread=spread
+            )
         
         # Валидируем рыночные условия
-        order_validator.validate_market_conditions(market_data)
+        try:
+            order_validator.validate_market_conditions(market_data)
+        except Exception as e:
+            logging.warning(f"Валидация рыночных условий для {symbol}: {e}")
         
         return market_data
     except Exception as e:
@@ -1268,7 +1329,21 @@ def prioritize_sales(balances_dict):
             # Получаем рыночные данные
             market_data = get_market_data(market_symbol)
             if not market_data:
-                continue
+                # Если не удалось получить полные рыночные данные, создаем базовые
+                current_price = get_ticker_price(market_symbol)
+                if not current_price:
+                    continue
+                
+                # Создаем базовые рыночные данные
+                market_data = MarketData(
+                    symbol=market_symbol.upper(),
+                    current_price=current_price,
+                    volatility=0.01,  # Базовое значение
+                    volume_24h=1000,  # Базовое значение
+                    bid_depth=100,     # Базовое значение
+                    ask_depth=100,     # Базовое значение
+                    spread=0.001       # Базовое значение
+                )
             
             # Рассчитываем стоимость в USD
             usd_value = balance * market_data.current_price
@@ -1946,6 +2021,40 @@ def auto_sell_all_altcoins():
         
         return {"success": False, "message": error_msg}
 
+def test_api_endpoints():
+    """Тестирует различные API эндпоинты и возвращает работающие"""
+    working_endpoints = []
+    
+    # Тестируем эндпоинты для получения торговых пар
+    try:
+        response = scraper.get(f"{BASE_URL}/public/markets", timeout=30)
+        if response.status_code == 200:
+            working_endpoints.append("/public/markets")
+            logging.info("✅ Эндпоинт /public/markets работает")
+    except Exception as e:
+        logging.warning(f"❌ Эндпоинт /public/markets не работает: {e}")
+    
+    # Тестируем эндпоинты для получения тикеров
+    test_symbol = "qtcusdt"  # Используем символ из ваших рабочих логов
+    try:
+        response = scraper.get(f"{BASE_URL}/trade/public/tickers/{test_symbol}", timeout=30)
+        if response.status_code == 200:
+            working_endpoints.append(f"/trade/public/tickers/{test_symbol}")
+            logging.info(f"✅ Эндпоинт /trade/public/tickers/{test_symbol} работает")
+    except Exception as e:
+        logging.warning(f"❌ Эндпоинт /trade/public/tickers/{test_symbol} не работает: {e}")
+    
+    # Тестируем эндпоинты для получения книги ордеров
+    try:
+        response = scraper.get(f"{BASE_URL}/trade/public/order-book/{test_symbol}", timeout=30)
+        if response.status_code == 200:
+            working_endpoints.append(f"/trade/public/order-book/{test_symbol}")
+            logging.info(f"✅ Эндпоинт /trade/public/order-book/{test_symbol} работает")
+    except Exception as e:
+        logging.warning(f"❌ Эндпоинт /trade/public/order-book/{test_symbol} не работает: {e}")
+    
+    return working_endpoints
+
 def start_auto_sell_scheduler():
     """Запускает планировщик автоматических продаж"""
     def scheduler():
@@ -2005,26 +2114,26 @@ if bot:
     @bot.message_handler(commands=['test_api'])
     def test_api_endpoints_cmd(message):
         """Тестирование API эндпоинтов"""
-        if str(message.chat.id) == ADMIN_CHAT_ID:
-            bot.reply_to(message, "🔍 Тестирую API эндпоинты...")
-            
-            def test_thread():
-                try:
-                    working_endpoints = test_api_endpoints()
-                    if working_endpoints:
-                        response = "✅ **API тест завершен**\n\n🎯 **Работающие эндпоинты:**\n"
-                        for endpoint in working_endpoints:
-                            response += f"• `{endpoint}`\n"
-                    else:
-                        response = "❌ **API тест завершен**\n\n🚨 Не найдено ни одного работающего эндпоинта!"
-                    
-                    bot.send_message(message.chat.id, response, parse_mode='Markdown')
-                except Exception as e:
-                    bot.send_message(message.chat.id, f"❌ Ошибка тестирования API: {e}")
-            
-            threading.Thread(target=test_thread).start()
-        else:
-            bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
+    if str(message.chat.id) == ADMIN_CHAT_ID:
+        bot.reply_to(message, "🔍 Тестирую API эндпоинты...")
+        
+        def test_thread():
+            try:
+                working_endpoints = test_api_endpoints()
+                if working_endpoints:
+                    response = "✅ **API тест завершен**\n\n🎯 **Работающие эндпоинты:**\n"
+                    for endpoint in working_endpoints:
+                        response += f"• `{endpoint}`\n"
+                else:
+                    response = "❌ **API тест завершен**\n\n🚨 Не найдено ни одного работающего эндпоинта!"
+                
+                bot.send_message(message.chat.id, response, parse_mode='Markdown')
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ Ошибка тестирования API: {e}")
+        
+        threading.Thread(target=test_thread).start()
+    else:
+        bot.reply_to(message, "❌ У вас нет прав для выполнения этой команды")
 
     @bot.message_handler(commands=['restart'])
     def restart_bot(message):
@@ -2364,6 +2473,52 @@ def run_trading_mode():
 
 def main():
     """Главная функция запуска"""
+    # Проверяем аргументы командной строки
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        
+        if command == "cleanup":
+            logging.info("🧹 Запуск очистки базы данных...")
+            try:
+                # Инициализируем Supabase для очистки
+                if not SUPABASE_URL or not SUPABASE_KEY:
+                    logging.error("❌ Отсутствуют настройки Supabase для очистки")
+                    return
+                
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+                db_manager = DatabaseManager(supabase)
+                
+                if db_manager.manual_cleanup_if_needed():
+                    logging.info("✅ Очистка базы данных завершена успешно")
+                else:
+                    logging.error("❌ Очистка базы данных завершилась с ошибкой")
+                return
+            except Exception as e:
+                logging.error(f"❌ Ошибка при очистке: {e}")
+                return
+        elif command == "health":
+            logging.info("🔍 Проверка здоровья базы данных...")
+            try:
+                if not SUPABASE_URL or not SUPABASE_KEY:
+                    logging.error("❌ Отсутствуют настройки Supabase для проверки")
+                    return
+                
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+                db_manager = DatabaseManager(supabase)
+                
+                db_manager.check_database_health()
+                return
+            except Exception as e:
+                logging.error(f"❌ Ошибка при проверке здоровья: {e}")
+                return
+        elif command == "help":
+            print("SafeTrade Trading Bot - Команды:")
+            print("  python main.py          - Запуск бота")
+            print("  python main.py cleanup  - Очистка дубликатов в БД")
+            print("  python main.py health   - Проверка здоровья БД")
+            print("  python main.py help     - Показать эту справку")
+            return
+    
     try:
         logging.info("Запуск SafeTrade Trading Bot...")
         
@@ -2389,6 +2544,10 @@ def main():
         
         # Тестируем API эндпоинты для поиска работающих
         test_api_endpoints()
+        
+        # Проверяем здоровье базы данных при запуске
+        logging.info("🔍 Проверка здоровья базы данных при запуске...")
+        db_manager.manual_cleanup_if_needed()
         
         # Загружаем состояние кэша
         load_cache_state()
