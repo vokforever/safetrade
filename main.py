@@ -151,8 +151,44 @@ ADMIN_CHAT_ID = os.getenv("SAFETRADE_ADMIN_CHAT_ID")
 CEREBRAS_API_KEY = os.getenv("SAFETRADE_CEREBRAS_API_KEY")
 
 # Supabase настройки
-SUPABASE_URL = os.getenv("SAFETRADE_SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SAFETRADE_SUPABASE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Проверяем загрузку переменных окружения
+def validate_environment():
+    """Проверка и валидация переменных окружения"""
+    missing_vars = []
+    
+    if not API_KEY:
+        missing_vars.append("SAFETRADE_API_KEY")
+    if not API_SECRET:
+        missing_vars.append("SAFETRADE_API_SECRET")
+    if not SUPABASE_URL:
+        missing_vars.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing_vars.append("SUPABASE_KEY")
+    
+    if missing_vars:
+        logging.error("❌ Отсутствуют обязательные переменные окружения:")
+        for var in missing_vars:
+            logging.error(f"   - {var}")
+        
+        logging.error("\n📋 Настройка переменных окружения:")
+        logging.error("1. Создайте файл .env в корне проекта")
+        logging.error("2. Добавьте следующие строки:")
+        logging.error("   SAFETRADE_API_KEY=your_api_key_here")
+        logging.error("   SAFETRADE_API_SECRET=your_api_secret_here")
+        logging.error("   SUPABASE_URL=your_supabase_url_here")
+        logging.error("   SUPABASE_KEY=your_supabase_key_here")
+        logging.error("3. Перезапустите бота")
+        
+        logging.error("\n🌐 Для CapRover/VPS:")
+        logging.error("Установите переменные окружения в настройках приложения")
+        
+        return False
+    
+    logging.info("✅ Все обязательные переменные окружения загружены")
+    return True
 
 # URL для пожертвований
 DONATE_URL = "https://boosty.to/vokforever/donate"
@@ -2648,34 +2684,43 @@ def main():
             print("  python main.py health   - Проверка здоровья БД")
             print("  python main.py help     - Показать эту справку")
             return
+        elif command == "env":
+            print("🔧 Проверка переменных окружения:")
+            print(f"   • SAFETRADE_API_KEY: {'✅' if API_KEY else '❌'}")
+            print(f"   • SAFETRADE_API_SECRET: {'✅' if API_SECRET else '❌'}")
+            print(f"   • SUPABASE_URL: {'✅' if SUPABASE_URL else '❌'}")
+            print(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
+            print(f"   • SAFETRADE_TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+            print(f"   • SAFETRADE_CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+            
+            if not validate_environment():
+                print("\n❌ Бот не может запуститься без обязательных переменных")
+            else:
+                print("\n✅ Все обязательные переменные настроены")
+            return
     
     try:
         logging.info("Запуск SafeTrade Trading Bot...")
         
-        # Проверяем обязательные переменные окружения
-        if not API_KEY or not API_SECRET:
-            logging.error("❌ Отсутствуют обязательные переменные окружения:")
-            logging.error("   - SAFETRADE_API_KEY")
-            logging.error("   - SAFETRADE_API_SECRET")
-            logging.error("Бот не может работать без API ключей SafeTrade")
+        # Показываем статус переменных окружения
+        logging.info("🔧 Статус переменных окружения:")
+        logging.info(f"   • SAFETRADE_API_KEY: {'✅' if API_KEY else '❌'}")
+        logging.info(f"   • SAFETRADE_API_SECRET: {'✅' if API_SECRET else '❌'}")
+        logging.info(f"   • SUPABASE_URL: {'✅' if SUPABASE_URL else '❌'}")
+        logging.info(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
+        logging.info(f"   • SAFETRADE_TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+        logging.info(f"   • SAFETRADE_CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+        
+        # Проверяем все обязательные переменные окружения
+        if not validate_environment():
+            logging.error("❌ Бот не может работать без обязательных переменных окружения")
             return
         
-        logging.info("✅ API ключи SafeTrade настроены")
+        logging.info("✅ Все обязательные переменные окружения настроены")
         
-        # Проверяем обязательные настройки Supabase
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            logging.error("❌ Отсутствуют обязательные настройки Supabase:")
-            logging.error("   - SAFETRADE_SUPABASE_URL")
-            logging.error("   - SAFETRADE_SUPABASE_KEY")
-            logging.error("Бот не может работать без Supabase")
-            return
-        
-        logging.info("✅ Supabase настройки проверены")
-        
-        # Тестируем API эндпоинты для поиска работающих
+
         test_api_endpoints()
         
-        # Проверяем здоровье базы данных при запуске
         logging.info("🔍 Проверка здоровья базы данных при запуске...")
         db_manager.check_database_health()
         

@@ -24,11 +24,11 @@ def cleanup_database():
     load_dotenv()
     
     # Получаем настройки Supabase
-    supabase_url = os.getenv('SAFETRADE_SUPABASE_URL')
-    supabase_key = os.getenv('SAFETRADE_SUPABASE_KEY')
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_KEY')
     
     if not supabase_url or not supabase_key:
-        logging.error("Не указаны переменные окружения SAFETRADE_SUPABASE_URL и SAFETRADE_SUPABASE_KEY")
+        logging.error("Не указаны переменные окружения SUPABASE_URL и SUPABASE_KEY")
         return False
     
     try:
