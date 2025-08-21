@@ -872,7 +872,8 @@ def get_all_markets():
                 ]
                 
                 logging.info(f"🔍 Найдено {len(usdt_markets)} USDT пар после фильтрации")
-                logging.info(f"📋 Примеры USDT пар: {[f'{m.get('base_unit', '').upper()}/USDT' for m in usdt_markets[:5]]}")
+                examples = [f"{m.get('base_unit', '').upper()}/USDT" for m in usdt_markets[:5]]
+                logging.info(f"📋 Примеры USDT пар: {examples}")
                 
                 with cache_lock:
                     markets_cache["data"] = usdt_markets
