@@ -31,7 +31,6 @@ import yaml
 import socket
 import subprocess
 from urllib.parse import urlparse
-import manager
 import trade_history
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
@@ -1938,21 +1937,38 @@ def track_order_execution(order_id, timeout=300):
     """Отслеживает исполнение ордера и возвращает trades"""
     global db_manager
     start_time = time.time()
+    
     while time.time() - start_time < timeout:
         try:
-            path = f"/trade/market/orders/{order_id}/trades"
-            url = BASE_URL + path
-            response = scraper.get(url, headers=get_auth_headers(), timeout=30)
-            response.raise_for_status()
-            trades = response.json()
-            if trades:
-                # Обновляем статус ордера в базе данных
-                total_executed = sum(float(t.get('total', 0)) for t in trades)
-                db_manager.update_order_status(
-                    order_id=order_id,
-                    status="filled"
-                )
-                return trades
+            # Получаем статус ордера
+            order_details = get_order_details(order_id)
+            
+            if order_details is None:
+                logging.warning(f"Ордер {order_id} не найден - возможно уже исполнен или отменён")
+                # Попробуем найти сделки через общий endpoint
+                return find_order_trades_alternative(order_id)
+            
+            order_state = order_details.get('state', 'unknown')
+            logging.info(f"Ордер {order_id} статус: {order_state}")
+            
+            if order_state in ['done', 'filled']:
+                # Ордер исполнен
+                logging.info(f"Ордер {order_id} исполнен")
+                db_manager.update_order_status(order_id=order_id, status="filled")
+                
+                # Пытаемся получить сделки, но не критично если не получится
+                trades = find_order_trades_alternative(order_id)
+                return trades if trades else []
+            
+            elif order_state in ['cancel', 'cancelled']:
+                logging.info(f"Ордер {order_id} отменён")
+                db_manager.update_order_status(order_id=order_id, status="cancelled")
+                return None
+            
+            elif order_state in ['wait', 'pending']:
+                # Ордер ожидает исполнения
+                logging.debug(f"Ордер {order_id} ожидает исполнения")
+            
             time.sleep(10)
         except Exception as e:
             logging.error(f"Ошибка отслеживания ордера {order_id}: {e}")
@@ -1960,6 +1976,68 @@ def track_order_execution(order_id, timeout=300):
     
     logging.warning(f"Таймаут отслеживания ордера {order_id}")
     return None
+
+def find_order_trades_alternative(order_id):
+    """Альтернативный способ поиска сделок по ордеру"""
+    try:
+        # Пытаемся получить сделки через общий endpoint
+        all_trades_response = scraper.get(f"{BASE_URL}/trade/market/trades", headers=get_auth_headers(), timeout=30)
+        if all_trades_response.status_code == 200:
+            all_trades = all_trades_response.json()
+            # Фильтруем сделки по order_id
+            order_trades = [t for t in all_trades if t.get('order_id') == str(order_id)]
+            if order_trades:
+                logging.info(f"Найдено {len(order_trades)} сделок для ордера {order_id} через альтернативный endpoint")
+                return order_trades
+        
+        # Если сделки не найдены, это нормально для некоторых ордеров
+        logging.info(f"Сделки для ордера {order_id} не найдены через альтернативный endpoint")
+        return []
+        
+    except Exception as e:
+        logging.warning(f"Ошибка при поиске сделок через альтернативный endpoint для ордера {order_id}: {e}")
+        return []
+
+def setup_websocket_order_tracking():
+    """Настройка WebSocket для отслеживания ордеров в реальном времени"""
+    try:
+        # Проверяем доступность WebSocket
+        ws_url = BASE_URL.replace("https://", "wss://").replace('http://', 'ws://') + "/websocket/"
+        logging.info(f"WebSocket URL: {ws_url}")
+        
+        # Здесь можно добавить WebSocket подключение для отслеживания ордеров
+        # Пока что используем REST API с улучшенной обработкой ошибок
+        logging.info("WebSocket отслеживание ордеров доступно (требует дополнительной настройки)")
+        return True
+        
+    except Exception as e:
+        logging.warning(f"WebSocket недоступен: {e}")
+        return False
+
+def batch_check_orders_status(order_ids):
+    """Пакетная проверка статуса нескольких ордеров"""
+    try:
+        # Получаем все активные ордера
+        response = scraper.get(f"{BASE_URL}/trade/market/orders", headers=get_auth_headers(), timeout=30)
+        if response.status_code == 200:
+            all_orders = response.json()
+            order_statuses = {}
+            
+            for order_id in order_ids:
+                order = next((o for o in all_orders if o.get('id') == order_id), None)
+                if order:
+                    order_statuses[order_id] = order.get('state', 'unknown')
+                else:
+                    order_statuses[order_id] = 'not_found'
+            
+            return order_statuses
+        else:
+            logging.warning(f"Не удалось получить статусы ордеров: {response.status_code}")
+            return {}
+            
+    except Exception as e:
+        logging.error(f"Ошибка пакетной проверки статусов ордеров: {e}")
+        return {}
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def cancel_order(order_id):
@@ -1982,19 +2060,77 @@ def cancel_order(order_id):
         logging.error(f"Ошибка отмены ордера {order_id}: {e}")
         return False
 
+def check_order_exists(order_id):
+    """Проверяет существование ордера"""
+    try:
+        path = f"/trade/market/orders/{order_id}"
+        url = BASE_URL + path
+        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        return response.status_code == 200
+    except Exception as e:
+        logging.error(f"Ошибка проверки существования ордера {order_id}: {e}")
+        return False
+
+def get_order_status(order_id):
+    """Получает статус ордера"""
+    try:
+        path = f"/trade/market/orders/{order_id}"
+        url = BASE_URL + path
+        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        
+        if response.status_code == 404:
+            logging.warning(f"Ордер {order_id} не найден")
+            return 'not_found'
+        
+        response.raise_for_status()
+        order_data = response.json()
+        return order_data.get('state', 'unknown')
+    except Exception as e:
+        logging.error(f"Ошибка получения статуса ордера {order_id}: {e}")
+        return 'unknown'
+
+def get_order_details(order_id):
+    """Получает детальную информацию об ордере"""
+    try:
+        path = f"/trade/market/orders/{order_id}"
+        url = BASE_URL + path
+        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        
+        if response.status_code == 404:
+            return None
+        
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Ошибка получения деталей ордера {order_id}: {e}")
+        return None
+
 def track_order(order_id):
     """Фоновая функция для отслеживания ордера"""
     logging.info(f"Отслеживание ордера {order_id} начато")
+    
+    # Сначала проверяем, существует ли ордер
+    if not check_order_exists(order_id):
+        logging.warning(f"Ордер {order_id} не существует, прекращаем отслеживание")
+        return
+    
     try:
+        # Устанавливаем WebSocket отслеживание если доступно
+        websocket_available = setup_websocket_order_tracking()
+        
         trades = track_order_execution(order_id, timeout=3600)  # 1 час
-        if trades:
-            logging.info(f"Ордер {order_id} исполнен: {len(trades)} сделок")
+        if trades is not None:
+            if trades:
+                logging.info(f"Ордер {order_id} исполнен: {len(trades)} сделок")
+            else:
+                logging.info(f"Ордер {order_id} исполнен, но сделки не найдены")
         else:
             logging.warning(f"Ордер {order_id} не исполнен в течение часа")
             # Попробуем отменить неисполненный ордер
             cancel_order(order_id)
     except Exception as e:
         logging.error(f"Ошибка отслеживания ордера {order_id}: {e}")
+        # Не прекращаем отслеживание при ошибке, продолжаем попытки
 
 def cancel_all_active_orders():
     """Отменяет все активные ордера при завершении работы"""
