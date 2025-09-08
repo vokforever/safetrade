@@ -1357,10 +1357,10 @@ def get_orderbook(symbol):
     
     # Список эндпоинтов для попытки получения книги ордеров (в порядке приоритета)
     endpoints = [
+        f"/public/markets/{symbol}/order-book",
         f"/trade/public/order-book/{symbol}",
-        f"/public/markets/{symbol}/order-book", 
-        f"/order-book/{symbol}",
-        f"/trade/order-book/{symbol}"
+        f"/public/order-book/{symbol}",
+        f"/order-book/{symbol}"
     ]
     
     for endpoint in endpoints:
@@ -2476,7 +2476,7 @@ if bot:
                     f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
                 )
             
-            response += f"💵 **Общая стоимость: ${total_usd:.2f}`**"
+            response += f"💵 **Общая стоимость: ${total_usd:.2f}**"
             
             bot.reply_to(message, response, parse_mode='Markdown')
         
