@@ -2462,13 +2462,15 @@ if bot:
             
             priority_scores = prioritize_sales(balances)
             
-            response = "💰 **Ваши балансы:**\n\n"
+            response = "💰 *Ваши балансы:*\n\n"
             total_usd = 0
             
             for i, score in enumerate(priority_scores, 1):
                 total_usd += score.usd_value
+                # Escape special Markdown characters
+                currency = str(score.currency).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
                 response += (
-                    f"{i}. **{score.currency}**\n"
+                    f"{i}. *{currency}*\n"
                     f"   • Количество: `{score.balance:.8f}`\n"
                     f"   • Цена: `${score.market_data.current_price:.6f}`\n"
                     f"   • Стоимость: `${score.usd_value:.2f}`\n"
@@ -2476,7 +2478,7 @@ if bot:
                     f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
                 )
             
-            response += f"💵 **Общая стоимость: ${total_usd:.2f}**"
+            response += f"💵 *Общая стоимость: ${total_usd:.2f}*"
             
             bot.reply_to(message, response, parse_mode='Markdown')
         
