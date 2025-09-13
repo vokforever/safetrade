@@ -14,7 +14,7 @@ services:
       - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
       - ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
     ports:
-      #- "8443:8443"  # Порт нужен для webhook
+      - "8443:8443"  # Порт нужен для webhook
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
