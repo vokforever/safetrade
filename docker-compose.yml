@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  botmonitor:
+  safetrade:
     build: .
-    container_name: botmonitor
+    container_name: safetrade
     restart: unless-stopped
     environment:
       - SAFETRADE_API_KEY=${SAFETRADE_API_KEY}
