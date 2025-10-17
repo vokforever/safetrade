@@ -1154,9 +1154,20 @@ def get_sellable_balances():
         path = "/trade/account/balances/spot"
         url = BASE_URL + path
         headers = get_auth_headers()
+        
+        logging.info(f"🔍 Запрос балансов по URL: {url}")
+        logging.info(f"🔍 Заголовки запроса: {headers}")
+        
         response = scraper.get(url, headers=headers, timeout=30)
+        
+        logging.info(f"🔍 Статус ответа: {response.status_code}")
+        if response.status_code != 200:
+            logging.error(f"🔍 Текст ответа: {response.text}")
+        
         response.raise_for_status()
         balances = response.json()
+        
+        logging.info(f"🔍 Получено балансов: {len(balances) if isinstance(balances, list) else 'не список'}")
         
         if not isinstance(balances, list):
             logging.warning("Некорректный формат балансов")
@@ -2856,6 +2867,14 @@ def main():
         logging.info(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
         logging.info(f"   • TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
         logging.info(f"   • CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+        
+        # Дополнительная отладка для API ключей
+        if API_KEY:
+            logging.info(f"   • API_KEY длина: {len(API_KEY)} символов")
+            logging.info(f"   • API_KEY префикс: {API_KEY[:8]}...")
+        if API_SECRET:
+            logging.info(f"   • API_SECRET длина: {len(API_SECRET)} символов")
+            logging.info(f"   • API_SECRET префикс: {API_SECRET[:8]}...")
         
         # Проверяем все обязательные переменные окружения
         if not validate_environment():
