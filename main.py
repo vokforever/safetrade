@@ -10,7 +10,13 @@ import cloudscraper
 from datetime import datetime, timedelta
 import threading
 from supabase import create_client, Client
-# from cerebras.cloud.sdk import Cerebras  # Temporarily commented out due to pydantic compatibility issues
+# --- ИНИЦИАЛИЗАЦИЯ CEREBRAS ---
+try:
+    from cerebras.cloud.sdk import Cerebras
+    CEREBRAS_AVAILABLE = True
+except ImportError:
+    CEREBRAS_AVAILABLE = False
+    logging.warning("Библиотека Cerebras SDK не найдена. Функции ИИ будут отключены.")
 import requests
 from pathlib import Path
 import random
@@ -808,13 +814,20 @@ except Exception as e:
 db_manager = DatabaseManager(supabase)
 logging.info("✅ Менеджер базы данных инициализирован")
 
-# Инициализируем Cerebras только если есть API ключ
+# Инициализируем Cerebras только если есть API ключ и библиотека доступна
 cerebras_client = None
-if CEREBRAS_API_KEY:
-    cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
-    logging.info("Cerebras AI подключен")
+if CEREBRAS_API_KEY and CEREBRAS_AVAILABLE:
+    try:
+        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
+        logging.info("Cerebras AI подключен")
+    except Exception as e:
+        logging.error(f"Ошибка инициализации Cerebras AI: {e}. Функции ИИ будут отключены.")
+        cerebras_client = None
 else:
-    logging.info("Cerebras AI не настроен - функции ИИ отключены")
+    if not CEREBRAS_API_KEY:
+        logging.info("Cerebras AI не настроен - функции ИИ отключены")
+    elif not CEREBRAS_AVAILABLE:
+        logging.info("Библиотека Cerebras недоступна - функции ИИ отключены")
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
