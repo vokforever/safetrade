@@ -44,7 +44,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("bot.log", encoding='utf-8'),
+        logging.FileHandler("/app/data/bot.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -2198,7 +2198,7 @@ def save_cache_state():
             "prices": prices_cache,
             "timestamp": time.time()
         }
-        with open("cache_state.json", "w") as f:
+        with open("/app/data/cache_state.json", "w") as f:
             json.dump(cache_state, f, default=str)
         logging.info("Состояние кэша сохранено")
     except Exception as e:
@@ -2207,7 +2207,7 @@ def save_cache_state():
 def load_cache_state():
     """Загружает состояние кэша при запуске"""
     try:
-        cache_file = Path("cache_state.json")
+        cache_file = Path("/app/data/cache_state.json")
         if cache_file.exists():
             with open(cache_file, "r") as f:
                 cache_state = json.load(f)

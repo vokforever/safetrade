@@ -1,46 +1,45 @@
 version: '3.8'
 
 services:
-  safetrade:
-    build: .
-    container_name: safetrade
+  safetrade-bot:
+    # --- Сборка образа ---
+    # Эта секция указывает Docker собрать образ из вашего Dockerfile,
+    # а не искать готовый образ в репозитории.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # Требование из вашего запроса: принудительно пересобирать образ,
+    # даже если он уже существует локально.
+    pull_policy: build
+
+    # --- Управление контейнером ---
+    # Перезапускать контейнер автоматически, если он упал, но не после ручной остановки.
+    # Критически важно для бота, который должен работать 24/7.
     restart: unless-stopped
-    environment:
-      - SAFETRADE_API_KEY=${SAFETRADE_API_KEY}
-      - SAFETRADE_API_SECRET=${SAFETRADE_API_SECRET}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-      - CEREBRAS_API_KEY=${CEREBRAS_API_KEY}
-      - ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
-    ports:
-      - "8443:8443"  # Порт нужен для webhook
+    
+    # Даем контейнеру понятное имя.
+    container_name: safetrade-bot-container
+
+    # --- Переменные окружения ---
+    # Загружаем все секретные ключи и токены из файла .env.
+    # Это безопасный способ управления конфигурацией.
+    env_file:
+      - .env
+
+    # --- Хранилище (Volumes) ---
+    # Создаем постоянное хранилище для логов и кэша.
+    # Это гарантирует, что ваши логи и данные не исчезнут при перезапуске контейнера.
     volumes:
-      - ./logs:/app/logs
-      - ./data:/app/data
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    # Если нужна база данных PostgreSQL
-    # depends_on:
-    #   - postgres
+      - bot_data:/app/data
 
-  # Раскомментируйте если нужна локальная PostgreSQL база
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: botmonitor-db
-  #   restart: unless-stopped
-  #   environment:
-  #     - POSTGRES_DB=${POSTGRES_DB:-botmonitor}
-  #     - POSTGRES_USER=${POSTGRES_USER:-admin}
-  #     - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
+    # --- Сеть и порты ---
+    # "Пробрасываем" порт 8443 из контейнера на хост-машину.
+    # Это необходимо только если вы используете режим Webhook.
+    ports:
+      - "8443:8443"
 
-# Если используете локальную PostgreSQL
-# volumes:
-#   postgres_data:
+# --- Определение именованных томов (volumes) ---
+# Docker будет управлять этим томом, что является предпочтительной практикой.
+volumes:
+  bot_data:
