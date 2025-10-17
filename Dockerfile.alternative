@@ -1,11 +1,14 @@
-# Используем официальный образ Python как базовый
-FROM python:3.11-slim-bullseye
+# Используем более стабильный базовый образ
+FROM python:3.11-slim
 
 # Устанавливаем рабочую директорию внутри контейнера
 WORKDIR /app
 
-# Устанавливаем зависимости для работы с PostgreSQL
-RUN apt-get update --fix-missing && \
+# Устанавливаем переменные окружения для предотвращения интерактивных запросов
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Обновляем пакеты и устанавливаем зависимости с обработкой ошибок
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     gcc \
     postgresql-client \
