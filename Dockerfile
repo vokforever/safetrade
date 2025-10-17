@@ -7,8 +7,10 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости, создаем виртуальную группу для сборки
-RUN apt-get update && \
+# Устанавливаем системные зависимости с обработкой сетевых ошибок
+# Добавляем опцию -qq для менее "шумного" вывода и пробуем обновиться трижды,
+# если первые попытки неудачны. Это помогает при нестабильной сети.
+RUN apt-get update -qq || apt-get update -qq || apt-get update -qq && \
     apt-get install -y --no-install-recommends curl && \
     apt-get install -y --no-install-recommends --virtual .build-deps gcc && \
     apt-get clean && \
