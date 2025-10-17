@@ -86,8 +86,8 @@ load_dotenv()
 # - SAFETRADE_API_SECRET - API секрет SafeTrade
 #
 # ОПЦИОНАЛЬНЫЕ переменные окружения (для расширенного функционала):
-# - SAFETRADE_TELEGRAM_BOT_TOKEN - Токен Telegram бота (для Telegram интерфейса)
-# - SAFETRADE_ADMIN_CHAT_ID - ID чата администратора (для уведомлений)
+# - TELEGRAM_BOT_TOKEN - Токен Telegram бота (для Telegram интерфейса)
+# - ADMIN_CHAT_ID - ID чата администратора (для уведомлений)
 # - SAFETRADE_CEREBRAS_API_KEY - API ключ Cerebras AI (для ИИ-помощника)
 # - SAFETRADE_SUPABASE_URL - URL Supabase (для облачной базы данных)
 # - SAFETRADE_SUPABASE_KEY - Ключ Supabase (для облачной базы данных)
@@ -153,8 +153,8 @@ CONFIG = load_config()
 # Загружаем токены и ID из переменных окружения
 API_KEY = os.getenv("SAFETRADE_API_KEY")
 API_SECRET = os.getenv("SAFETRADE_API_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("SAFETRADE_TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("SAFETRADE_ADMIN_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 CEREBRAS_API_KEY = os.getenv("SAFETRADE_CEREBRAS_API_KEY")
 
 # Supabase настройки
@@ -782,7 +782,7 @@ bot = None
 if TELEGRAM_BOT_TOKEN:
     bot = RobustTeleBot(TELEGRAM_BOT_TOKEN)
 else:
-    logging.warning("SAFETRADE_TELEGRAM_BOT_TOKEN не указан. Telegram бот будет отключен.")
+    logging.warning("TELEGRAM_BOT_TOKEN не указан. Telegram бот будет отключен.")
 
 # Инициализируем Supabase (обязательно)
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -2836,8 +2836,8 @@ def main():
             print(f"   • SAFETRADE_API_SECRET: {'✅' if API_SECRET else '❌'}")
             print(f"   • SUPABASE_URL: {'✅' if SUPABASE_URL else '❌'}")
             print(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
-            print(f"   • SAFETRADE_TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
-            print(f"   • SAFETRADE_CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+            print(f"   • TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+            print(f"   • CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
             
             if not validate_environment():
                 print("\n❌ Бот не может запуститься без обязательных переменных")
@@ -2854,8 +2854,8 @@ def main():
         logging.info(f"   • SAFETRADE_API_SECRET: {'✅' if API_SECRET else '❌'}")
         logging.info(f"   • SUPABASE_URL: {'✅' if SUPABASE_URL else '❌'}")
         logging.info(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
-        logging.info(f"   • SAFETRADE_TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
-        logging.info(f"   • SAFETRADE_CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+        logging.info(f"   • TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
+        logging.info(f"   • CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
         
         # Проверяем все обязательные переменные окружения
         if not validate_environment():

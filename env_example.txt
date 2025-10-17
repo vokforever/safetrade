@@ -8,8 +8,8 @@ SUPABASE_URL=your_supabase_project_url_here
 SUPABASE_KEY=your_supabase_anon_key_here
 
 # ОПЦИОНАЛЬНЫЕ переменные (для расширенного функционала):
-SAFETRADE_TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-SAFETRADE_ADMIN_CHAT_ID=your_admin_chat_id_here
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+ADMIN_CHAT_ID=your_admin_chat_id_here
 SAFETRADE_CEREBRAS_API_KEY=your_cerebras_api_key_here
 SAFETRADE_WEBHOOK_URL=your_webhook_url_here
 SAFETRADE_WEBHOOK_PORT=8443

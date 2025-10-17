@@ -10,13 +10,13 @@ from datetime import datetime
 # Загружаем переменные окружения
 load_dotenv()
 
-TELEGRAM_BOT_TOKEN = os.getenv("SAFETRADE_TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = os.getenv("SAFETRADE_ADMIN_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 
 def test_admin_notification():
     """Тестирует отправку уведомления администратору"""
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ SAFETRADE_TELEGRAM_BOT_TOKEN не найден")
+        print("❌ TELEGRAM_BOT_TOKEN не найден")
         return False
     
     if not ADMIN_CHAT_ID:
