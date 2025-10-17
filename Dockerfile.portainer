@@ -1,12 +1,16 @@
-# Используем официальный образ Python как базовый
-FROM python:3.11-slim-bullseye
+# Используем более стабильный базовый образ
+FROM python:3.11-slim
 
 # Устанавливаем рабочую директорию внутри контейнера
 WORKDIR /app
 
-# Устанавливаем зависимости для работы с PostgreSQL
-RUN apt-get update || true && \
-    apt-get install -y --no-install-recommends \
+# Устанавливаем переменные окружения для предотвращения интерактивных запросов
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Moscow
+
+# Устанавливаем зависимости поэтапно с обработкой ошибок
+RUN apt-get update --fix-missing || true && \
+    apt-get install -y --no-install-recommends --fix-missing \
     gcc \
     postgresql-client \
     && apt-get clean \
@@ -16,7 +20,8 @@ RUN apt-get update || true && \
 COPY requirements.txt .
 
 # Устанавливаем все зависимости, указанные в requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Копируем весь остальной код вашего бота в рабочую директорию контейнера
 COPY . .
