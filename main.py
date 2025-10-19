@@ -11,14 +11,8 @@ from datetime import datetime, timedelta
 import threading
 from supabase import create_client, Client
 # --- УСЛОВНЫЙ ИМПОРТ И ИНИЦИАЛИЗАЦИЯ ИИ ---
-AI_ENABLED = CONFIG['main'].get('ai_enabled', False)
-if AI_ENABLED:
-    try:
-        import ai_assistant
-        from ai_assistant import TradingDecision, SellStrategy
-    except ImportError:
-        logging.error("Не удалось импортировать ai_assistant.py. Функции ИИ будут отключены.")
-        AI_ENABLED = False
+# Временно установим значение по умолчанию, будет обновлено после загрузки конфигурации
+AI_ENABLED = False
 import requests
 from pathlib import Path
 import random
@@ -229,6 +223,15 @@ ALLOWED_CURRENCIES = CONFIG['trading']['allowed_currencies']
 MIN_POSITION_VALUE_USD = CONFIG['trading']['min_position_value_usd']
 MAX_CONCURRENT_SALES = CONFIG['trading']['max_concurrent_sales']
 AUTO_SELL_INTERVAL = CONFIG['trading']['auto_sell_interval']
+
+# --- УСЛОВНЫЙ ИМПОРТ И ИНИЦИАЛИЗАЦИЯ ИИ ПОСЛЕ ЗАГРУЗКИ КОНФИГУРАЦИИ ---
+if AI_ENABLED:
+    try:
+        import ai_assistant
+        from ai_assistant import TradingDecision, SellStrategy
+    except ImportError:
+        logging.error("Не удалось импортировать ai_assistant.py. Функции ИИ будут отключены.")
+        AI_ENABLED = False
 
 # Кэширование с locks для thread safety
 cache_lock = Lock()
