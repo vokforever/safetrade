@@ -262,6 +262,20 @@ class OrderStatus(Enum):
     CANCELLED = "cancelled"
     FAILED = "failed"
 
+# Определяем MarketData здесь, чтобы он был доступен всегда
+@dataclass
+class MarketData:
+    symbol: str
+    current_price: float
+    volatility: float
+    volume_24h: float
+    bid_depth: float
+    ask_depth: float
+    spread: float
+    
+    def to_dict(self):
+        return asdict(self)
+
 @dataclass
 class BalanceInfo:
     currency: str
@@ -275,7 +289,7 @@ class PriorityScore:
     balance: float
     usd_value: float
     priority_score: float
-    market_data: "MarketData"  # Используем кавычки для отложенного типа
+    market_data: MarketData
 
 # --- УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ ---
 class DatabaseManager:
@@ -1397,23 +1411,6 @@ def get_market_data(symbol):
         # В простом режиме, если не нужна сложная аналитика, можно не получать книгу ордеров
         if EASY_MODE:
             logging.debug(f"Easy Mode: Пропускаем загрузку книги ордеров для {symbol}")
-            # Импортируем MarketData из ai_assistant если нужно
-            if AI_ENABLED:
-                from ai_assistant import MarketData
-            else:
-                # Создаем локальный класс MarketData для простого режима
-                @dataclass
-                class MarketData:
-                    symbol: str
-                    current_price: float
-                    volatility: float
-                    volume_24h: float
-                    bid_depth: float
-                    ask_depth: float
-                    spread: float
-                    
-                    def to_dict(self):
-                        return asdict(self)
             
             return MarketData(
                 symbol=symbol.upper(),
@@ -1427,23 +1424,6 @@ def get_market_data(symbol):
         # Если не удалось получить книгу ордеров, используем базовые значения
         if not orderbook:
             logging.warning(f"Не удалось получить книгу ордеров для {symbol}, используем базовые значения")
-            # Импортируем MarketData из ai_assistant если нужно
-            if AI_ENABLED:
-                from ai_assistant import MarketData
-            else:
-                # Создаем локальный класс MarketData
-                @dataclass
-                class MarketData:
-                    symbol: str
-                    current_price: float
-                    volatility: float
-                    volume_24h: float
-                    bid_depth: float
-                    ask_depth: float
-                    spread: float
-                    
-                    def to_dict(self):
-                        return asdict(self)
             
             market_data = MarketData(
                 symbol=symbol.upper(),
@@ -1474,24 +1454,6 @@ def get_market_data(symbol):
             response.raise_for_status()
             ticker = response.json()
             volume_24h = float(ticker.get('vol', 0))
-            
-            # Импортируем MarketData из ai_assistant если нужно
-            if AI_ENABLED:
-                from ai_assistant import MarketData
-            else:
-                # Создаем локальный класс MarketData
-                @dataclass
-                class MarketData:
-                    symbol: str
-                    current_price: float
-                    volatility: float
-                    volume_24h: float
-                    bid_depth: float
-                    ask_depth: float
-                    spread: float
-                    
-                    def to_dict(self):
-                        return asdict(self)
             
             market_data = MarketData(
                 symbol=symbol.upper(),
@@ -1533,23 +1495,6 @@ def prioritize_sales(balances_dict):
                 current_price = get_ticker_price(market_symbol)
                 if not current_price:
                     continue
-                
-                # Импортируем или создаем MarketData
-                if AI_ENABLED:
-                    from ai_assistant import MarketData
-                else:
-                    @dataclass
-                    class MarketData:
-                        symbol: str
-                        current_price: float
-                        volatility: float
-                        volume_24h: float
-                        bid_depth: float
-                        ask_depth: float
-                        spread: float
-                        
-                        def to_dict(self):
-                            return asdict(self)
                 
                 # Создаем базовые рыночные данные
                 market_data = MarketData(
