@@ -35,6 +35,83 @@ import subprocess
 from urllib.parse import urlparse
 import trade_history
 
+# --- SAFE TRADE API КЛИЕНТ ---
+class SafeTradeAPI:
+    def __init__(self, api_key: str, api_secret: str):
+        if not api_key or not api_secret:
+            raise ValueError("API key and secret cannot be empty.")
+        
+        self.key = api_key
+        self.secret = api_secret.encode('utf-8')
+        self.base_url = "https://safe.trade/api/v2"
+        self.scraper = cloudscraper.create_scraper()
+
+    def _sign_payload(self, payload: dict) -> str:
+        """Signs the JSON payload using HMAC-SHA256, as required by the API."""
+        json_payload = json.dumps(payload)
+        return hmac.new(self.secret, json_payload.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    def _get_auth_headers(self, payload: dict) -> dict:
+        """Generates the required authentication headers for a private request."""
+        nonce = str(int(time.time() * 1000))
+        signature = self._sign_payload(payload)
+        return {
+            'X-Auth-Apikey': self.key,
+            'X-Auth-Nonce': nonce,
+            'X-Auth-Signature': signature,
+            'Content-Type': 'application/json'
+        }
+
+    def get(self, path: str, is_private: bool = False):
+        """Sends a GET request. Handles both public and private endpoints."""
+        url = self.base_url + path
+        headers = {}
+        if is_private:
+            # For GET requests, the payload to sign is empty
+            headers = self._get_auth_headers({})
+            
+        response = self.scraper.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def post(self, path: str, payload: dict):
+        """Sends an authenticated POST request."""
+        url = self.base_url + path
+        headers = self._get_auth_headers(payload)
+        response = self.scraper.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    # --- Wrapper methods for specific API calls ---
+
+    def get_balances(self):
+        """Fetches all account balances."""
+        return self.get("/account/balances", is_private=True)
+
+    def create_order(self, market: str, side: str, volume: float, ord_type: str, price: float = None):
+        """
+        Creates a new order.
+        Note the parameter names: 'volume' and 'ord_type'.
+        """
+        payload = {
+            "market": market,
+            "side": side,
+            "volume": str(volume),
+            "ord_type": ord_type,
+        }
+        if ord_type == "limit" and price:
+            payload["price"] = str(price)
+        
+        return self.post("/market/orders", payload)
+
+    def get_orders(self):
+        """Fetches all orders."""
+        return self.get("/market/orders", is_private=True)
+
+    def cancel_order(self, order_id: str):
+        """Cancels an order."""
+        return self.post(f"/market/orders/{order_id}/cancel", {})
+
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
 logging.basicConfig(
     level=logging.INFO,
@@ -214,6 +291,14 @@ DONATE_URL = "https://boosty.to/vokforever/donate"
 # Убедимся, что секрет в байтовом представлении для hmac
 API_SECRET_BYTES = API_SECRET.encode('utf-8') if API_SECRET else None
 BASE_URL = "https://safe.trade/api/v2"
+
+# Инициализируем новый API клиент
+try:
+    api_client = SafeTradeAPI(API_KEY, API_SECRET)
+    logging.info("✅ SafeTrade API клиент успешно инициализирован.")
+except ValueError as e:
+    logging.error(f"❌ Не удалось инициализировать API клиент: {e}")
+    sys.exit(1)
 
 # Настройки из конфигурации с приоритетом переменных окружения
 EASY_MODE = EASY_MODE_ENV if EASY_MODE_ENV is not None else CONFIG['main']['easy_mode']
@@ -1127,21 +1212,8 @@ def get_markets_from_db():
 def get_sellable_balances():
     """Получает балансы всех криптовалют кроме USDT"""
     try:
-        path = "/trade/account/balances/spot"
-        url = BASE_URL + path
-        headers = get_auth_headers()
-        
-        logging.info(f"🔍 Запрос балансов по URL: {url}")
-        logging.info(f"🔍 Заголовки запроса: {headers}")
-        
-        response = scraper.get(url, headers=headers, timeout=30)
-        
-        logging.info(f"🔍 Статус ответа: {response.status_code}")
-        if response.status_code != 200:
-            logging.error(f"🔍 Текст ответа: {response.text}")
-        
-        response.raise_for_status()
-        balances = response.json()
+        # Используем новый API клиент для получения балансов
+        balances = api_client.get_balances()
         
         logging.info(f"🔍 Получено балансов: {len(balances) if isinstance(balances, list) else 'не список'}")
         
@@ -1797,35 +1869,25 @@ def extract_order_id_from_result(result_text):
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
-    """Создает ордер на продажу и возвращает отформатированный результат"""
+    """Создает ордер на продажу, используя НОВЫЙ и ПРАВИЛЬНЫЙ API клиент."""
     global db_manager
     try:
         # Валидация параметров
         order_validator.validate_order_params(market_symbol, amount, order_type, price)
         
-        path = "/trade/market/orders"
-        url = BASE_URL + path
-        
         # Определяем валюты из символа
         base_currency = market_symbol.replace('usdt', '').upper()
-        
-        payload = {
-            "market": market_symbol,
-            "side": "sell",
-            "type": order_type,
-            "amount": str(amount)
-        }
-        
-        if order_type == "limit" and price:
-            payload["price"] = str(price)
-        
-        headers = get_auth_headers()
-        response = scraper.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        order_details = response.json()
+
+        # !!! ИСПОЛЬЗУЕМ НОВЫЙ КЛИЕНТ И ПРАВИЛЬНЫЕ ПАРАМЕТРЫ !!!
+        order_details = api_client.create_order(
+            market=market_symbol,
+            side="sell",
+            volume=amount,          # 'volume', а не 'amount'
+            ord_type=order_type     # 'ord_type', а не 'type'
+        )
         
         order_id = order_details.get('id')
-        order_amount = order_details.get('amount', amount)
+        order_amount = order_details.get('volume', amount)  # Используем 'volume' из ответа
         
         # Сохраняем данные об ордере в локальную базу
         db_manager.insert_order_history(
@@ -1833,7 +1895,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             timestamp=datetime.now().isoformat(),
             symbol=order_details.get('market', 'N/A'),
             side=order_details.get('side', 'N/A'),
-            order_type=order_details.get('type', 'N/A'),
+            order_type=order_details.get('ord_type', 'N/A'),  # 'ord_type' вместо 'type'
             amount=float(order_amount),
             price=float(order_details.get('price', 0)) if order_details.get('price') else None,
             total=float(order_details.get('total', 0)) if order_details.get('total') else None,
@@ -1847,19 +1909,20 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             f"✅ *Успешно размещен ордер на продажу!*\n\n"
             f"*Биржа:* SafeTrade\n"
             f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
-            f"*Тип:* `{order_details.get('type', 'N/A').capitalize()}`\n"
+            f"*Тип:* `{order_details.get('ord_type', 'N/A').capitalize()}`\n"
             f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
             f"*Заявленный объем:* `{order_amount} {base_currency}`\n"
             f"*ID ордера:* `{order_id}`"
         )
     except Exception as e:
-        error_message = f"❌ Ошибка при создании ордера на продажу на SafeTrade: {e}"
+        error_message = f"❌ Ошибка при создании ордера на продажу: {e}"
         if hasattr(e, 'response') and e.response is not None:
             try:
-                error_details = e.response.text
-                error_message += f"\nОтвет сервера: `{error_details}`"
+                error_details = e.response.json()  # API отвечает в JSON
+                error_msg = error_details.get('errors', [str(error_details)])
+                error_message += f"\nОтвет сервера: `{json.dumps(error_msg)}`"
             except:
-                pass
+                error_message += f"\nОтвет сервера: `{e.response.text}`"
         logging.error(error_message)
         return error_message
 
@@ -1975,10 +2038,8 @@ def cancel_order(order_id):
     """Отменяет ордер"""
     global db_manager
     try:
-        path = f"/trade/market/orders/{order_id}/cancel"
-        url = BASE_URL + path
-        response = scraper.post(url, headers=get_auth_headers(), timeout=30)
-        response.raise_for_status()
+        # Используем новый API клиент для отмены ордера
+        api_client.cancel_order(order_id)
         logging.info(f"Ордер {order_id} отменён")
         
         # Обновляем статус в базе данных
@@ -1994,10 +2055,10 @@ def cancel_order(order_id):
 def check_order_exists(order_id):
     """Проверяет существование ордера"""
     try:
-        path = f"/trade/market/orders/{order_id}"
-        url = BASE_URL + path
-        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
-        return response.status_code == 200
+        # Используем новый API клиент для проверки существования ордера
+        # Сначала получаем все ордера и ищем нужный
+        orders = api_client.get_orders()
+        return any(order.get('id') == order_id for order in orders)
     except Exception as e:
         logging.error(f"Ошибка проверки существования ордера {order_id}: {e}")
         return False
@@ -2005,17 +2066,14 @@ def check_order_exists(order_id):
 def get_order_status(order_id):
     """Получает статус ордера"""
     try:
-        path = f"/trade/market/orders/{order_id}"
-        url = BASE_URL + path
-        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        # Используем новый API клиент для получения статуса ордера
+        orders = api_client.get_orders()
+        for order in orders:
+            if order.get('id') == order_id:
+                return order.get('state', 'unknown')
         
-        if response.status_code == 404:
-            logging.warning(f"Ордер {order_id} не найден")
-            return 'not_found'
-        
-        response.raise_for_status()
-        order_data = response.json()
-        return order_data.get('state', 'unknown')
+        logging.warning(f"Ордер {order_id} не найден")
+        return 'not_found'
     except Exception as e:
         logging.error(f"Ошибка получения статуса ордера {order_id}: {e}")
         return 'unknown'
@@ -2023,15 +2081,13 @@ def get_order_status(order_id):
 def get_order_details(order_id):
     """Получает детальную информацию об ордере"""
     try:
-        path = f"/trade/market/orders/{order_id}"
-        url = BASE_URL + path
-        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
+        # Используем новый API клиент для получения деталей ордера
+        orders = api_client.get_orders()
+        for order in orders:
+            if order.get('id') == order_id:
+                return order
         
-        if response.status_code == 404:
-            return None
-        
-        response.raise_for_status()
-        return response.json()
+        return None
     except Exception as e:
         logging.error(f"Ошибка получения деталей ордера {order_id}: {e}")
         return None
@@ -2066,11 +2122,8 @@ def track_order(order_id):
 def cancel_all_active_orders():
     """Отменяет все активные ордера при завершении работы"""
     try:
-        path = "/trade/market/orders"
-        url = BASE_URL + path
-        response = scraper.get(url, headers=get_auth_headers(), timeout=30)
-        response.raise_for_status()
-        orders = response.json()
+        # Используем новый API клиент для получения всех ордеров
+        orders = api_client.get_orders()
         
         for order in orders:
             if order.get('state') in ['wait', 'pending']:
@@ -2893,58 +2946,17 @@ def save_trade_history_to_db(trade_history_client):
         logging.error(f"Ошибка при сохранении истории сделок в БД: {e}")
 
 def get_safetrade_order_history():
-    """Получает историю ордеров из SafeTrade API с улучшенной обработкой"""
+    """Получает историю ордеров из SafeTrade API с использованием нового клиента"""
     try:
-        # Пробуем несколько эндпоинтов для получения истории ордеров
-        endpoints = [
-            "/trade/market/orders",
-            "/peatio/market/orders", 
-            "/trade/account/orders",
-            "/peatio/account/orders"
-        ]
+        # Используем новый API клиент для получения истории ордеров
+        orders = api_client.get_orders()
         
-        for endpoint in endpoints:
-            try:
-                url = BASE_URL + endpoint
-                headers = get_auth_headers()
-                response = scraper.get(url, headers=headers, timeout=30)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    logging.info(f"Ответ от {endpoint}: {json.dumps(data, indent=2)[:500]}...")
-                    
-                    if isinstance(data, list) and len(data) > 0:
-                        logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(data)} ордеров")
-                        return data
-                    elif isinstance(data, dict) and data.get('data'):
-                        # Некоторые API возвращают данные в поле 'data'
-                        orders = data['data']
-                        if isinstance(orders, list) and len(orders) > 0:
-                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
-                            return orders
-                    elif isinstance(data, dict) and data.get('orders'):
-                        # Альтернативное поле для ордеров
-                        orders = data['orders']
-                        if isinstance(orders, list) and len(orders) > 0:
-                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
-                            return orders
-                    elif isinstance(data, dict) and data.get('result'):
-                        # Еще одно возможное поле
-                        orders = data['result']
-                        if isinstance(orders, list) and len(orders) > 0:
-                            logging.info(f"✅ История ордеров успешно получена через {endpoint}: {len(orders)} ордеров")
-                            return orders
-                    else:
-                        logging.warning(f"Неожиданная структура ответа от {endpoint}: {type(data)}")
-                else:
-                    logging.warning(f"Эндпоинт {endpoint} вернул статус {response.status_code}")
-                    
-            except Exception as e:
-                logging.warning(f"Ошибка при запросе к {endpoint}: {e}")
-                continue
-        
-        logging.error("❌ Не удалось получить историю ордеров ни с одного эндпоинта")
-        return None
+        if isinstance(orders, list) and len(orders) > 0:
+            logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров")
+            return orders
+        else:
+            logging.warning("Получен пустой список ордеров")
+            return []
         
     except Exception as e:
         logging.error(f"❌ Критическая ошибка при получении истории ордеров: {e}")
