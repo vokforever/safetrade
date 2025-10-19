@@ -10,13 +10,15 @@ import cloudscraper
 from datetime import datetime, timedelta
 import threading
 from supabase import create_client, Client
-# --- ИНИЦИАЛИЗАЦИЯ CEREBRAS ---
-try:
-    from cerebras.cloud.sdk import Cerebras
-    CEREBRAS_AVAILABLE = True
-except ImportError:
-    CEREBRAS_AVAILABLE = False
-    logging.warning("Библиотека Cerebras SDK не найдена. Функции ИИ будут отключены.")
+# --- УСЛОВНЫЙ ИМПОРТ И ИНИЦИАЛИЗАЦИЯ ИИ ---
+AI_ENABLED = CONFIG['main'].get('ai_enabled', False)
+if AI_ENABLED:
+    try:
+        import ai_assistant
+        from ai_assistant import TradingDecision, SellStrategy
+    except ImportError:
+        logging.error("Не удалось импортировать ai_assistant.py. Функции ИИ будут отключены.")
+        AI_ENABLED = False
 import requests
 from pathlib import Path
 import random
@@ -108,6 +110,10 @@ load_dotenv()
 # ПРИМЕЧАНИЕ: Бот будет работать ТОЛЬКО с SAFETRADE_API_KEY и SAFETRADE_API_SECRET!
 # Все остальные функции будут отключены, если соответствующие переменные не указаны.
 DEFAULT_CONFIG = {
+    'main': {
+        'easy_mode': True,      # <-- НОВОЕ: Простой режим для продажи всего по рынку
+        'ai_enabled': False,    # <-- НОВОE: Включить/выключить ИИ-помощника
+    },
     'trading': {
         'excluded_currencies': ['USDT', 'BUSD', 'USDC'],
         'allowed_currencies': [],  # Пустой список = проверять все валюты, если указаны - только их
@@ -132,7 +138,8 @@ DEFAULT_CONFIG = {
     'risk_management': {
         'max_position_value': 10000,
         'min_spread_threshold': 0.001,
-        'max_volatility_threshold': 0.05
+        'max_volatility_threshold': 0.05,
+        'max_spread_threshold': 0.02  # <-- ИСПРАВЛЕНО: Добавлен недостающий ключ (значение 2%)
     },
     'cache': {
         'markets_duration': 14400,  # 4 часа
@@ -166,6 +173,10 @@ CEREBRAS_API_KEY = os.getenv("SAFETRADE_CEREBRAS_API_KEY")
 # Supabase настройки
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Настройки режимов работы из переменных окружения (с переопределением из конфига)
+EASY_MODE_ENV = os.getenv("SAFETRADE_EASY_MODE", "").lower() in ("true", "1", "yes", "on")
+AI_ENABLED_ENV = os.getenv("SAFETRADE_AI_ENABLED", "").lower() in ("true", "1", "yes", "on")
 
 # Проверяем загрузку переменных окружения
 def validate_environment():
@@ -210,7 +221,9 @@ DONATE_URL = "https://boosty.to/vokforever/donate"
 API_SECRET_BYTES = API_SECRET.encode('utf-8') if API_SECRET else None
 BASE_URL = "https://safe.trade/api/v2"
 
-# Настройки из конфигурации
+# Настройки из конфигурации с приоритетом переменных окружения
+EASY_MODE = EASY_MODE_ENV if EASY_MODE_ENV is not None else CONFIG['main']['easy_mode']
+AI_ENABLED = AI_ENABLED_ENV if AI_ENABLED_ENV is not None else CONFIG['main']['ai_enabled']
 EXCLUDED_CURRENCIES = CONFIG['trading']['excluded_currencies']
 ALLOWED_CURRENCIES = CONFIG['trading']['allowed_currencies']
 MIN_POSITION_VALUE_USD = CONFIG['trading']['min_position_value_usd']
@@ -238,33 +251,13 @@ orderbook_cache = {
 # Semaphore для ограничения concurrent продаж
 sales_sem = Semaphore(MAX_CONCURRENT_SALES)
 
-# Стратегии продаж
-class SellStrategy(Enum):
-    MARKET = "market"
-    LIMIT = "limit"
-    TWAP = "twap"
-    ICEBERG = "iceberg"
-    ADAPTIVE = "adaptive"
-
+# Стратегии продаж (импортируются из ai_assistant при необходимости)
 class OrderStatus(Enum):
     PENDING = "pending"
     PARTIAL = "partial"
     FILLED = "filled"
     CANCELLED = "cancelled"
     FAILED = "failed"
-
-@dataclass
-class MarketData:
-    symbol: str
-    current_price: float
-    volatility: float
-    volume_24h: float
-    bid_depth: float
-    ask_depth: float
-    spread: float
-    
-    def to_dict(self):
-        return asdict(self)
 
 @dataclass
 class BalanceInfo:
@@ -279,52 +272,7 @@ class PriorityScore:
     balance: float
     usd_value: float
     priority_score: float
-    market_data: MarketData
-
-@dataclass
-class TradingDecision:
-    strategy: SellStrategy
-    parameters: Dict[str, Any]
-    reasoning: str
-    confidence: float
-
-# Улучшенный Rate Limiter для Cerebras
-class RateLimiter:
-    def __init__(self, requests_per_min=30, tokens_per_min=60000):
-        self.requests_per_min = requests_per_min
-        self.tokens_per_min = tokens_per_min
-        self.request_times = deque()
-        self.token_usage = deque()
-        self.lock = Lock()
-    
-    def can_make_request(self, estimated_tokens=1000):
-        with self.lock:
-            now = time.time()
-            minute_ago = now - 60
-            
-            # Очищаем старые записи
-            while self.request_times and self.request_times[0] < minute_ago:
-                self.request_times.popleft()
-            
-            while self.token_usage and self.token_usage[0][0] < minute_ago:
-                self.token_usage.popleft()
-            
-            # Проверяем лимиты
-            current_requests = len(self.request_times)
-            current_tokens = sum(usage[1] for usage in self.token_usage)
-            
-            return (current_requests < self.requests_per_min and 
-                    current_tokens + estimated_tokens < self.tokens_per_min)
-    
-    def record_usage(self, tokens_used):
-        with self.lock:
-            now = time.time()
-            self.request_times.append(now)
-            self.token_usage.append((now, tokens_used))
-
-# Настройки для Cerebras API
-CEREBRAS_MODEL = "qwen-3-235b-a22b-thinking-2507"
-cerebras_limiter = RateLimiter()
+    market_data: "MarketData"  # Используем кавычки для отложенного типа
 
 # --- УПРАВЛЕНИЕ БАЗОЙ ДАННЫХ ---
 class DatabaseManager:
@@ -814,20 +762,18 @@ except Exception as e:
 db_manager = DatabaseManager(supabase)
 logging.info("✅ Менеджер базы данных инициализирован")
 
-# Инициализируем Cerebras только если есть API ключ и библиотека доступна
+# Инициализируем Cerebras только если включен и есть ключ
 cerebras_client = None
-if CEREBRAS_API_KEY and CEREBRAS_AVAILABLE:
-    try:
-        cerebras_client = Cerebras(api_key=CEREBRAS_API_KEY)
-        logging.info("Cerebras AI подключен")
-    except Exception as e:
-        logging.error(f"Ошибка инициализации Cerebras AI: {e}. Функции ИИ будут отключены.")
-        cerebras_client = None
+if AI_ENABLED and CEREBRAS_API_KEY:
+    ai_assistant.initialize_ai(CEREBRAS_API_KEY)
+    cerebras_client = ai_assistant.cerebras_client # ссылка на глобальный клиент в модуле
 else:
-    if not CEREBRAS_API_KEY:
-        logging.info("Cerebras AI не настроен - функции ИИ отключены")
-    elif not CEREBRAS_AVAILABLE:
+    if not CEREBRAS_API_KEY and AI_ENABLED:
+        logging.info("ИИ включен в конфиге, но CEREBRAS_API_KEY не указан - функции ИИ отключены")
+    elif AI_ENABLED:
         logging.info("Библиотека Cerebras недоступна - функции ИИ отключены")
+    else:
+        logging.info("ИИ-помощник отключен в конфигурации.")
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -1444,13 +1390,58 @@ def get_market_data(symbol):
         if not current_price:
             logging.warning(f"Не удалось получить цену для {symbol}")
             return None
-        
+
+        # В простом режиме, если не нужна сложная аналитика, можно не получать книгу ордеров
+        if EASY_MODE:
+            logging.debug(f"Easy Mode: Пропускаем загрузку книги ордеров для {symbol}")
+            # Импортируем MarketData из ai_assistant если нужно
+            if AI_ENABLED:
+                from ai_assistant import MarketData
+            else:
+                # Создаем локальный класс MarketData для простого режима
+                @dataclass
+                class MarketData:
+                    symbol: str
+                    current_price: float
+                    volatility: float
+                    volume_24h: float
+                    bid_depth: float
+                    ask_depth: float
+                    spread: float
+                    
+                    def to_dict(self):
+                        return asdict(self)
+            
+            return MarketData(
+                symbol=symbol.upper(),
+                current_price=current_price,
+                volatility=0, volume_24h=0, bid_depth=0, ask_depth=0, spread=0
+            )
+
         # Получаем книгу ордеров
         orderbook = get_orderbook(symbol)
         
         # Если не удалось получить книгу ордеров, используем базовые значения
         if not orderbook:
             logging.warning(f"Не удалось получить книгу ордеров для {symbol}, используем базовые значения")
+            # Импортируем MarketData из ai_assistant если нужно
+            if AI_ENABLED:
+                from ai_assistant import MarketData
+            else:
+                # Создаем локальный класс MarketData
+                @dataclass
+                class MarketData:
+                    symbol: str
+                    current_price: float
+                    volatility: float
+                    volume_24h: float
+                    bid_depth: float
+                    ask_depth: float
+                    spread: float
+                    
+                    def to_dict(self):
+                        return asdict(self)
+            
             market_data = MarketData(
                 symbol=symbol.upper(),
                 current_price=current_price,
@@ -1480,6 +1471,24 @@ def get_market_data(symbol):
             response.raise_for_status()
             ticker = response.json()
             volume_24h = float(ticker.get('vol', 0))
+            
+            # Импортируем MarketData из ai_assistant если нужно
+            if AI_ENABLED:
+                from ai_assistant import MarketData
+            else:
+                # Создаем локальный класс MarketData
+                @dataclass
+                class MarketData:
+                    symbol: str
+                    current_price: float
+                    volatility: float
+                    volume_24h: float
+                    bid_depth: float
+                    ask_depth: float
+                    spread: float
+                    
+                    def to_dict(self):
+                        return asdict(self)
             
             market_data = MarketData(
                 symbol=symbol.upper(),
@@ -1522,6 +1531,23 @@ def prioritize_sales(balances_dict):
                 if not current_price:
                     continue
                 
+                # Импортируем или создаем MarketData
+                if AI_ENABLED:
+                    from ai_assistant import MarketData
+                else:
+                    @dataclass
+                    class MarketData:
+                        symbol: str
+                        current_price: float
+                        volatility: float
+                        volume_24h: float
+                        bid_depth: float
+                        ask_depth: float
+                        spread: float
+                        
+                        def to_dict(self):
+                            return asdict(self)
+                
                 # Создаем базовые рыночные данные
                 market_data = MarketData(
                     symbol=market_symbol.upper(),
@@ -1540,25 +1566,30 @@ def prioritize_sales(balances_dict):
             if usd_value < MIN_POSITION_VALUE_USD:
                 continue
             
-            # Рассчитываем приоритетный балл
-            weight_value = 0.4
-            weight_liquidity = 0.3
-            weight_volatility = 0.2
-            weight_spread = 0.1
-            
-            # Нормализуем показатели (0-1)
-            value_score = min(usd_value / 1000, 1.0)
-            liquidity_score = min(market_data.bid_depth / 10000, 1.0)
-            volatility_score = 1 - min(market_data.volatility * 100, 1.0)
-            spread_score = 1 - min(market_data.spread * 100, 1.0)
-            
-            # Итоговый балл
-            priority_score = (
-                weight_value * value_score +
-                weight_liquidity * liquidity_score +
-                weight_volatility * volatility_score +
-                weight_spread * spread_score
-            )
+            # В простом режиме приоритет основан только на стоимости в USD
+            if EASY_MODE:
+                priority_score = usd_value
+            else:
+                # Сложный расчет приоритета (старая логика)
+                # Рассчитываем приоритетный балл
+                weight_value = 0.4
+                weight_liquidity = 0.3
+                weight_volatility = 0.2
+                weight_spread = 0.1
+                
+                # Нормализуем показатели (0-1)
+                value_score = min(usd_value / 1000, 1.0)
+                liquidity_score = min(market_data.bid_depth / 10000, 1.0)
+                volatility_score = 1 - min(market_data.volatility * 100, 1.0)
+                spread_score = 1 - min(market_data.spread * 100, 1.0)
+                
+                # Итоговый балл
+                priority_score = (
+                    weight_value * value_score +
+                    weight_liquidity * liquidity_score +
+                    weight_volatility * volatility_score +
+                    weight_spread * spread_score
+                )
             
             priority_scores.append(PriorityScore(
                 currency=currency,
@@ -1577,126 +1608,7 @@ def prioritize_sales(balances_dict):
     
     return priority_scores
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_ai_trading_decision(currency, balance, market_data):
-    """Получение решения о торговле от ИИ для конкретной валюты"""
-    global db_manager
-    if not cerebras_client:
-        return None
-    
-    estimated_tokens = 2000
-    if not cerebras_limiter.can_make_request(estimated_tokens):
-        logging.warning("Достигнут лимит Cerebras API. Используется стандартная стратегия.")
-        return None
-    
-    try:
-        # Валидация входных данных
-        if balance <= 0 or not market_data:
-            logging.warning(f"Некорректные данные для ИИ: balance={balance}, market_data={market_data}")
-            return None
-        
-        # Определяем размер позиции в USD
-        usd_value = balance * market_data.current_price
-        
-        # Выбираем базовую стратегию на основе размера позиции
-        if usd_value < 50:
-            base_strategy = "market"
-        elif usd_value < 500:
-            base_strategy = "limit"
-        else:
-            base_strategy = "twap"
-        
-        # Формируем контекст для ИИ
-        context = f"""
-        Ты - торговый ИИ-ассистент для криптовалютной биржи SafeTrade. Твоя задача - проанализировать текущие рыночные условия и предложить оптимальную стратегию для продажи {balance} {currency} за USDT.
-        
-        Текущие рыночные данные:
-        - Баланс {currency}: {balance}
-        - Стоимость в USD: ${usd_value:.2f}
-        - Текущая цена: {market_data.current_price}
-        - Волатильность рынка: {market_data.volatility:.4f}
-        - Объем торгов за 24 часа: {market_data.volume_24h}
-        - Глубина книги ордеров (покупка): {market_data.bid_depth}
-        - Глубина книги ордеров (продажа): {market_data.ask_depth}
-        - Спред: {market_data.spread:.4f}
-        
-        Рекомендуемая базовая стратегия: {base_strategy}
-        
-        Доступные стратегии:
-        1. market - немедленное исполнение по рыночной цене
-        2. limit - исполнение по указанной цене или лучше
-        3. twap - разделение на части через равные промежутки времени
-        4. iceberg - отображение только части ордера
-        5. adaptive - динамический выбор на основе рыночных условий
-        
-        Ответь в формате JSON:
-        {{
-            "strategy": "market|limit|twap|iceberg|adaptive",
-            "parameters": {{
-                "price": 0.0,
-                "duration_minutes": 60,
-                "chunks": 6,
-                "visible_amount": 0.1,
-                "max_attempts": 20
-            }},
-            "reasoning": "Обоснование выбора стратегии",
-            "confidence": 0.85
-        }}
-        """
-        
-        # Отправляем запрос к ИИ
-        response = cerebras_client.chat.completions.create(
-            messages=[{"role": "user", "content": context}],
-            model=CEREBRAS_MODEL,
-            max_completion_tokens=4000,
-        )
-        
-        # Парсим ответ
-        ai_response = response.choices[0].message.content
-        
-        # Ищем JSON в ответе
-        try:
-            start_idx = ai_response.find('{')
-            end_idx = ai_response.rfind('}') + 1
-            if start_idx != -1 and end_idx != -1:
-                json_str = ai_response[start_idx:end_idx]
-                decision = json.loads(json_str)
-                
-                # Создаем объект решения
-                trading_decision = TradingDecision(
-                    strategy=SellStrategy(decision.get("strategy", "market")),
-                    parameters=decision.get("parameters", {}),
-                    reasoning=decision.get("reasoning", ""),
-                    confidence=decision.get("confidence", 0.5)
-                )
-                
-                # Сохраняем решение ИИ
-                db_manager.insert_ai_decision(
-                    timestamp=datetime.now().isoformat(),
-                    decision_type="trading_strategy",
-                    decision_data=json.dumps(decision),
-                    market_data=json.dumps(market_data.to_dict()),
-                    reasoning=trading_decision.reasoning,
-                    confidence=trading_decision.confidence
-                )
-                
-                # Обновляем использование rate limiter
-                input_tokens = len(context) // 4
-                output_tokens = len(ai_response) // 4
-                cerebras_limiter.record_usage(input_tokens + output_tokens)
-                
-                return trading_decision
-            else:
-                logging.error(f"Не удалось найти JSON в ответе ИИ: {ai_response}")
-                return None
-        except (json.JSONDecodeError, ValueError) as e:
-            logging.error(f"Ошибка парсинга JSON из ответа ИИ: {e}")
-            return None
-    except Exception as e:
-        logging.error(f"Ошибка при получении решения от ИИ: {e}")
-        return None
-
-def execute_trading_strategy(priority_score: PriorityScore, ai_decision: TradingDecision = None):
+def execute_trading_strategy(priority_score: PriorityScore, ai_decision: "TradingDecision" = None):
     """Исполняет торговую стратегию для конкретной валюты"""
     try:
         market_symbol = f"{priority_score.currency.lower()}usdt"
@@ -1705,10 +1617,40 @@ def execute_trading_strategy(priority_score: PriorityScore, ai_decision: Trading
         # Валидируем параметры
         order_validator.validate_order_params(market_symbol, amount)
         
+        # В ПРОСТОМ РЕЖИМЕ ВСЕГДА ПРОДАЕМ ПО РЫНКУ
+        if EASY_MODE:
+            logging.info(f"Easy Mode: Исполняем рыночную продажу для {priority_score.currency}")
+            return execute_market_sell(market_symbol, amount)
+
+        # Используем стандартную логику выбора стратегии для сложного режима
         if ai_decision and ai_decision.strategy:
+            # Импортируем стратегии если ИИ включен
+            if AI_ENABLED:
+                from ai_assistant import SellStrategy
+            else:
+                # Создаем локальный класс SellStrategy
+                class SellStrategy(Enum):
+                    MARKET = "market"
+                    LIMIT = "limit"
+                    TWAP = "twap"
+                    ICEBERG = "iceberg"
+                    ADAPTIVE = "adaptive"
+            
             strategy = ai_decision.strategy
             parameters = ai_decision.parameters
         else:
+            # Импортируем стратегии если ИИ включен
+            if AI_ENABLED:
+                from ai_assistant import SellStrategy
+            else:
+                # Создаем локальный класс SellStrategy
+                class SellStrategy(Enum):
+                    MARKET = "market"
+                    LIMIT = "limit"
+                    TWAP = "twap"
+                    ICEBERG = "iceberg"
+                    ADAPTIVE = "adaptive"
+            
             # Используем стандартную логику выбора стратегии
             if priority_score.usd_value < 50:
                 strategy = SellStrategy.MARKET
@@ -2235,6 +2177,10 @@ def auto_sell_all_altcoins():
     Главная функция автоматической продажи всех альткоинов
     """
     logging.info("Запуск автоматической продажи всех альткоинов")
+    if EASY_MODE:
+        logging.info("🤖 РЕЖИМ: Простая продажа (EASY_MODE)")
+    else:
+        logging.info("🤖 РЕЖИМ: Продвинутая продажа со стратегиями")
     
     try:
         with sales_sem:  # Ограничиваем количество одновременных продаж
@@ -2259,13 +2205,14 @@ def auto_sell_all_altcoins():
                 try:
                     logging.info(f"Обработка {score.currency}: {score.balance} (${score.usd_value:.2f})")
                     
-                    # Получаем решение ИИ для оптимальной стратегии
                     ai_decision = None
-                    if cerebras_client:
-                        ai_decision = get_ai_trading_decision(
-                            score.currency, 
-                            score.balance, 
-                            score.market_data
+                    # Получаем решение ИИ, только если он включен и мы не в простом режиме
+                    if AI_ENABLED and not EASY_MODE and cerebras_client:
+                        ai_decision = ai_assistant.get_ai_trading_decision(
+                            score.currency,
+                            score.balance,
+                            score.market_data,
+                            db_manager  # Передаем db_manager
                         )
                     
                     # Исполняем торговую стратегию
@@ -2293,8 +2240,10 @@ def auto_sell_all_altcoins():
             
             # Отправляем отчет администратору (если бот настроен)
             if bot and ADMIN_CHAT_ID:
+                mode_text = "Простой режим" if EASY_MODE else "Продвинутый режим"
                 report = (
                     f"🤖 **Отчет по автопродажам**\n\n"
+                    f"🔧 **Режим:** {mode_text}\n"
                     f"📊 **Статистика:**\n"
                     f"• Обработано валют: {total_processed}\n"
                     f"• Успешных продаж: {successful_sales}\n"
@@ -2309,8 +2258,8 @@ def auto_sell_all_altcoins():
                 
                 try:
                     bot.send_message(
-                        ADMIN_CHAT_ID, 
-                        report, 
+                        ADMIN_CHAT_ID,
+                        report,
                         parse_mode='Markdown'
                     )
                     logging.info("📱 Отчет отправлен администратору")
@@ -2862,6 +2811,8 @@ def main():
             print(f"   • SUPABASE_KEY: {'✅' if SUPABASE_KEY else '❌'}")
             print(f"   • TELEGRAM_BOT_TOKEN: {'✅' if TELEGRAM_BOT_TOKEN else '❌'}")
             print(f"   • CEREBRAS_API_KEY: {'✅' if CEREBRAS_API_KEY else '❌'}")
+            print(f"   • SAFETRADE_EASY_MODE: {'✅' + str(EASY_MODE) if 'EASY_MODE_ENV' in globals() else '⚪ (из конфига)'}")
+            print(f"   • SAFETRADE_AI_ENABLED: {'✅' + str(AI_ENABLED) if 'AI_ENABLED_ENV' in globals() else '⚪ (из конфига)'}")
             
             if not validate_environment():
                 print("\n❌ Бот не может запуститься без обязательных переменных")
@@ -2896,6 +2847,16 @@ def main():
         
         logging.info("✅ Все обязательные переменные окружения настроены")
         
+        # Показываем источники настроек режимов
+        if EASY_MODE_ENV is not None:
+            logging.warning(f"🔥 Включен EASY_MODE (из переменной окружения): вся продажа будет осуществляться по рыночным ценам без сложных проверок.")
+        elif EASY_MODE:
+            logging.warning(f"🔥 Включен EASY_MODE (из config.yml): вся продажа будет осуществляться по рыночным ценам без сложных проверок.")
+            
+        if AI_ENABLED_ENV is not None:
+            logging.info(f"🧠 ИИ-помощник включен (из переменной окружения).")
+        elif AI_ENABLED:
+            logging.info(f"🧠 ИИ-помощник включен (из config.yml).")
 
         test_api_endpoints()
         
