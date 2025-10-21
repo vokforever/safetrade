@@ -1,4 +1,4 @@
-# --- Основные зависимости ---
+# --- Main dependencies ---
 requests>=2.31.0
 python-dotenv>=1.0.0
 cloudscraper>=1.2.60
@@ -7,17 +7,17 @@ aiohttp>=3.8.0
 tenacity>=8.2.0
 PyYAML>=6.0
 
-# --- КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ ЗДЕСЬ ---
-# Откатываем supabase до версии, совместимой с pydantic v1
+# --- KEY CHANGES HERE ---
+# Rollback supabase to version compatible with pydantic v1
 supabase<2.0
 
-# Cerebras AI и его критическая зависимость Pydantic v1
+# Cerebras AI and its critical dependency Pydantic v1
 cerebras_cloud_sdk>=0.1.0
 pydantic>=1.0,<2.0
 
-# --- Зависимости для Webhook режима (опционально) ---
+# --- Dependencies for Webhook mode (optional) ---
 flask>=2.3.0
 gunicorn>=21.0.0
 
-# --- Неявная зависимость ---
+# --- Implicit dependency ---
 pytz>=2023.3

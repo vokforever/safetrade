@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import cloudscraper
 from datetime import datetime, timedelta
 import threading
-from supabase import create_client, Client
+from supabase.client import create_client, Client
 # --- УСЛОВНЫЙ ИМПОРТ И ИНИЦИАЛИЗАЦИЯ ИИ ---
 # Временно установим значение по умолчанию, будет обновлено после загрузки конфигурации
 AI_ENABLED = False
@@ -34,6 +34,7 @@ import socket
 import subprocess
 from urllib.parse import urlparse
 import trade_history
+import binascii  # Add this import for the fixed signature generation
 
 # --- SAFE TRADE API КЛИЕНТ ---
 class SafeTradeAPI:
@@ -46,29 +47,31 @@ class SafeTradeAPI:
         self.base_url = "https://safe.trade/api/v2"
         self.scraper = cloudscraper.create_scraper()
 
-    def _sign_payload(self, payload: dict) -> str:
-        """Signs the JSON payload using HMAC-SHA256, as required by the API."""
-        json_payload = json.dumps(payload)
-        return hmac.new(self.secret, json_payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    def _sign_payload(self, nonce: str) -> str:
+        """Signs the nonce + key string using HMAC-SHA256, as required by the API."""
+        # Use the correct signature generation method from the fixed API client
+        string_to_sign = nonce + self.key
+        hash = hmac.new(self.secret, digestmod=hashlib.sha256)
+        hash.update(string_to_sign.encode())
+        signature = hash.digest()
+        signature_hex = binascii.hexlify(signature).decode()
+        return signature_hex
 
-    def _get_auth_headers(self, payload: dict) -> dict:
+    def _get_auth_headers(self) -> dict:
         """Generates the required authentication headers for a private request."""
         nonce = str(int(time.time() * 1000))
-        signature = self._sign_payload(payload)
+        signature = self._sign_payload(nonce)
         return {
             'X-Auth-Apikey': self.key,
             'X-Auth-Nonce': nonce,
             'X-Auth-Signature': signature,
-            'Content-Type': 'application/json'
+            'Content-Type': 'application/json;charset=utf-8'  # Use correct content type
         }
 
-    def get(self, path: str, is_private: bool = False):
-        """Sends a GET request. Handles both public and private endpoints."""
+    def get(self, path: str):
+        """Sends a GET request with proper authentication."""
         url = self.base_url + path
-        headers = {}
-        if is_private:
-            # For GET requests, the payload to sign is empty
-            headers = self._get_auth_headers({})
+        headers = self._get_auth_headers()
             
         response = self.scraper.get(url, headers=headers, timeout=30)
         response.raise_for_status()
@@ -77,7 +80,7 @@ class SafeTradeAPI:
     def post(self, path: str, payload: dict):
         """Sends an authenticated POST request."""
         url = self.base_url + path
-        headers = self._get_auth_headers(payload)
+        headers = self._get_auth_headers()
         response = self.scraper.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         return response.json()
@@ -86,38 +89,63 @@ class SafeTradeAPI:
 
     def get_balances(self):
         """Fetches all account balances."""
-        return self.get("/account/balances", is_private=True)
+        # Try multiple endpoints for getting balances
+        endpoints = [
+            "/account/balances",  # Original endpoint that's not working
+            "/trade/account/balances",  # Alternative in trade namespace
+            "/account/balance"  # Another possible endpoint
+        ]
+        
+        for endpoint in endpoints:
+            try:
+                result = self.get(endpoint)
+                if result:
+                    logging.info(f"✅ Балансы получены через эндпоинт: {endpoint}")
+                    return result
+            except Exception as e:
+                logging.warning(f"❌ Эндпоинт {endpoint} не сработал: {e}")
+                continue
+        
+        logging.error("❌ Не удалось получить балансы через ни один из известных эндпоинтов")
+        return None
 
-    def create_order(self, market: str, side: str, volume: float, ord_type: str, price: float = None):
+    def create_order(self, market: str, side: str, amount: float, order_type: str, price: Optional[float] = None):
         """
-        Creates a new order.
-        Note the parameter names: 'volume' and 'ord_type'.
+        Creates a new order with CORRECT parameters.
+        Note the parameter names: 'amount' and 'type'.
         """
         payload = {
             "market": market,
             "side": side,
-            "volume": str(volume),
-            "ord_type": ord_type,
+            "amount": str(amount),  # ✅ Use 'amount' not 'volume'
+            "type": order_type,     # ✅ Use 'type' not 'ord_type'
         }
-        if ord_type == "limit" and price:
+        if order_type == "limit" and price:
             payload["price"] = str(price)
         
-        return self.post("/market/orders", payload)
+        return self.post("/trade/market/orders", payload)
 
     def get_orders(self):
         """Fetches all orders."""
-        return self.get("/market/orders", is_private=True)
+        return self.get("/trade/market/orders")
 
     def cancel_order(self, order_id: str):
         """Cancels an order."""
-        return self.post(f"/market/orders/{order_id}/cancel", {})
+        return self.post(f"/trade/market/orders/{order_id}/cancel", {})
 
 # --- НАСТРОЙКИ ЛОГИРОВАНИЯ ---
+import os
+from pathlib import Path
+
+# Создаем директорию для логов
+log_dir = Path("data")
+log_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/app/data/bot.log", encoding='utf-8'),
+        logging.FileHandler(log_dir / "bot.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -183,7 +211,7 @@ load_dotenv()
 DEFAULT_CONFIG = {
     'main': {
         'easy_mode': True,      # <-- НОВОЕ: Простой режим для продажи всего по рынку
-        'ai_enabled': False,    # <-- НОВОE: Включить/выключить ИИ-помощника
+        'ai_enabled': False,    # <-- НОВОЕ: Включить/выключить ИИ-помощника
     },
     'trading': {
         'excluded_currencies': ['USDT', 'BUSD', 'USDC'],
@@ -277,7 +305,7 @@ def validate_environment():
         logging.error("   SUPABASE_KEY=your_supabase_key_here")
         logging.error("3. Перезапустите бота")
         
-        logging.error("\n🌐 Для CapRover/VPS:")
+        logging.error("\n唐宇 Для CapRover/VPS:")
         logging.error("Установите переменные окружения в настройках приложения")
         
         return False
@@ -292,12 +320,19 @@ DONATE_URL = "https://boosty.to/vokforever/donate"
 API_SECRET_BYTES = API_SECRET.encode('utf-8') if API_SECRET else None
 BASE_URL = "https://safe.trade/api/v2"
 
-# Инициализируем новый API клиент
-try:
-    api_client = SafeTradeAPI(API_KEY, API_SECRET)
-    logging.info("✅ SafeTrade API клиент успешно инициализирован.")
-except ValueError as e:
-    logging.error(f"❌ Не удалось инициализировать API клиент: {e}")
+# Инициализируем API клиент
+def initialize_api_client():
+    global api_client
+    if API_KEY and API_SECRET:
+        api_client = SafeTradeAPI(API_KEY, API_SECRET)
+        return True
+    else:
+        api_client = None
+        logging.error("❌ API ключи не настроены! Бот не может работать без API ключей.")
+        return False
+
+# Вызываем инициализацию
+if not initialize_api_client():
     sys.exit(1)
 
 # Настройки из конфигурации с приоритетом переменных окружения
@@ -413,27 +448,27 @@ class DatabaseManager:
             raise
     
     def insert_price_history(self, timestamp: str, symbol: str, price: float, 
-                           volume: float = None, high: float = None, low: float = None):
+                           volume: Optional[float] = None, high: Optional[float] = None, low: Optional[float] = None):
         """Вставка исторических данных о ценах"""
         try:
             data = {
-                'timestamp': timestamp,
-                'symbol': symbol,
-                'price': price,
-                'volume': volume,
-                'high': high,
-                'low': low,
-                'created_at': datetime.now().isoformat()
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "price": price,
+                "volume": volume,
+                "high": high,
+                "low": low,
+                "created_at": datetime.now().isoformat()
             }
             result = self.supabase.table('safetrade_price_history').insert(data).execute()
             return result.data[0] if result.data else None
         except Exception as e:
             logging.error(f"Ошибка вставки данных о ценах: {e}")
             return None
-    
+
     def insert_order_history(self, order_id: str, timestamp: str, symbol: str, 
                            side: str, order_type: str, amount: float, 
-                           price: float = None, total: float = None, status: str = "pending"):
+                           price: Optional[float] = None, total: Optional[float] = None, status: str = "pending"):
         """Вставка истории ордеров"""
         try:
             data = {
@@ -454,7 +489,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка вставки истории ордеров: {e}")
             return None
-    
+
     def update_order_status(self, order_id: str, status: str):
         """Обновление статуса ордера"""
         try:
@@ -467,9 +502,9 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка обновления статуса ордера: {e}")
             return None
-    
+
     def insert_ai_decision(self, timestamp: str, decision_type: str, decision_data: str,
-                          market_data: str = None, reasoning: str = None, confidence: float = None):
+                          market_data: Optional[str] = None, reasoning: Optional[str] = None, confidence: Optional[float] = None):
         """Вставка решений ИИ"""
         try:
             data = {
@@ -486,7 +521,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка вставки решения ИИ: {e}")
             return None
-    
+
     def insert_trading_pair(self, symbol: str, base_currency: str, quote_currency: str, is_active: bool = True):
         """Вставка торговой пары с правильной обработкой дубликатов"""
         try:
@@ -519,9 +554,9 @@ class DatabaseManager:
             else:
                 logging.error(f"Ошибка вставки торговой пары {symbol}: {e}")
                 return None
-    
+
     def insert_performance_metric(self, timestamp: str, metric_type: str, metric_name: str, 
-                                value: float, metadata: str = None):
+                                value: float, metadata: Optional[str] = None):
         """Вставка метрики производительности"""
         try:
             data = {
@@ -537,7 +572,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка вставки метрики: {e}")
             return None
-    
+
     def get_ai_decisions(self, limit: int = 10):
         """Получение последних решений ИИ"""
         try:
@@ -546,7 +581,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка получения решений ИИ: {e}")
             return []
-    
+
     def cleanup_duplicate_trading_pairs(self):
         """Очистка дублирующихся торговых пар"""
         try:
@@ -568,100 +603,44 @@ class DatabaseManager:
             # Если RPC не работает, используем альтернативный метод
             try:
                 logging.info("Попытка альтернативной очистки дубликатов...")
-                # Получаем все символы с дубликатами
-                result = self.supabase.table('safetrade_trading_pairs').select('symbol').execute()
+                # Получаем все записи
+                result = self.supabase.table('safetrade_trading_pairs').select('*').execute()
                 
                 if result.data:
-                    symbols = [row['symbol'] for row in result.data]
-                    # Создаем временную таблицу с уникальными записями
+                    # Создаем словарь для отслеживания уникальных символов
                     unique_pairs = {}
+                    duplicates_to_delete = []
+                    
                     for row in result.data:
                         symbol = row['symbol']
-                        if symbol not in unique_pairs:
-                            unique_pairs[symbol] = row
+                        row_id = row['id']
+                        
+                        if symbol in unique_pairs:
+                            # Это дубликат, помечаем для удаления
+                            duplicates_to_delete.append(row_id)
+                        else:
+                            # Первый раз видим этот символ
+                            unique_pairs[symbol] = row_id
                     
-                    # Очищаем таблицу и вставляем уникальные записи
-                    self.supabase.table('safetrade_trading_pairs').delete().neq('id', '').execute()
+                    # Удаляем дубликаты
+                    if duplicates_to_delete:
+                        for dup_id in duplicates_to_delete:
+                            try:
+                                self.supabase.table('safetrade_trading_pairs').delete().eq('id', dup_id).execute()
+                            except Exception as delete_error:
+                                logging.warning(f"Не удалось удалить дубликат с id {dup_id}: {delete_error}")
+                        
+                        logging.info(f"Удалено {len(duplicates_to_delete)} дублирующихся записей")
                     
-                    for pair in unique_pairs.values():
-                        self.supabase.table('safetrade_trading_pairs').insert(pair).execute()
-                    
-                    logging.info(f"Очистка завершена. Оставлено {len(unique_pairs)} уникальных записей")
                     return True
-            except Exception as alt_e:
-                logging.warning(f"Не удалось очистить дублирующиеся записи: {e}, альтернативный метод: {alt_e}")
-                return False
-    
-    def force_cleanup_duplicates(self):
-        """Принудительная очистка дубликатов с безопасным подходом"""
-        try:
-            logging.info("Начинаем принудительную очистку дубликатов...")
-            
-            # Получаем все уникальные записи
-            result = self.supabase.table('safetrade_trading_pairs').select('*').execute()
-            
-            if not result.data:
-                logging.info("Таблица пуста, очистка не требуется")
-                return True
-            
-            # Создаем словарь уникальных записей по символу
-            unique_records = {}
-            for record in result.data:
-                symbol = record['symbol']
-                if symbol not in unique_records:
-                    unique_records[symbol] = record
-            
-            logging.info(f"Найдено {len(result.data)} записей, уникальных: {len(unique_records)}")
-            
-            # Безопасная очистка - удаляем только дубликаты, сохраняя уникальные
-            all_symbols = [row['symbol'] for row in result.data]
-            duplicate_symbols = [symbol for symbol in all_symbols if all_symbols.count(symbol) > 1]
-            
-            if duplicate_symbols:
-                # Удаляем дубликаты по одному символу
-                for symbol in set(duplicate_symbols):
-                    # Оставляем первую запись, удаляем остальные
-                    symbol_records = [row for row in result.data if row['symbol'] == symbol]
-                    if len(symbol_records) > 1:
-                        # Удаляем все кроме первой
-                        for record in symbol_records[1:]:
-                            if 'id' in record:
-                                self.supabase.table('safetrade_trading_pairs').delete().eq('id', record['id']).execute()
-                                logging.debug(f"Удален дубликат {symbol} с ID {record['id']}")
-            
-            logging.info(f"Очистка завершена. Сохранено {len(unique_records)} уникальных записей")
-            return True
-            
-        except Exception as e:
-            logging.error(f"Ошибка при принудительной очистке: {e}")
-            return False
-    
-    def manual_cleanup_if_needed(self):
-        """Ручная очистка дубликатов если их много"""
-        try:
-            total_count = self.get_trading_pairs_count()
-            duplicate_count = self.get_duplicate_count()
-            
-            if duplicate_count > 0:
-                logging.warning(f"🔧 Ручная очистка: обнаружено {duplicate_count} дубликатов из {total_count} записей")
-                
-                if duplicate_count > total_count * 0.1:  # Если больше 10% дубликатов
-                    logging.info("🚨 Критическое количество дубликатов! Запуск принудительной очистки...")
-                    return self.force_cleanup_duplicates()
-                elif duplicate_count > total_count * 0.05:  # Если больше 5% дубликатов
-                    logging.info("⚠️ Умеренное количество дубликатов. Запуск очистки...")
-                    return self.force_cleanup_duplicates()
                 else:
-                    logging.info("ℹ️ Небольшое количество дубликатов, очистка не требуется")
+                    logging.info("Нет записей для очистки")
                     return True
-            else:
-                logging.info("✅ Дубликатов не обнаружено")
-                return True
-                
-        except Exception as e:
-            logging.error(f"Ошибка при ручной очистке: {e}")
-            return False
-    
+                    
+            except Exception as alt_error:
+                logging.error(f"Ошибка альтернативной очистки дубликатов: {alt_error}")
+                return False
+
     def get_duplicate_count(self):
         """Получение количества дублирующихся записей"""
         try:
@@ -672,22 +651,20 @@ class DatabaseManager:
             
             symbols = [row['symbol'] for row in result.data]
             unique_symbols = set(symbols)
-            duplicate_count = len(symbols) - len(unique_symbols)
-            
-            return duplicate_count
+            return len(symbols) - len(unique_symbols)
         except Exception as e:
-            logging.error(f"Ошибка при подсчете дубликатов: {e}")
+            logging.error(f"Ошибка получения количества дубликатов: {e}")
             return 0
-    
+
     def get_trading_pairs_count(self):
         """Получение количества торговых пар в базе"""
         try:
-            result = self.supabase.table('safetrade_trading_pairs').select('symbol', count='exact').execute()
-            return result.count if hasattr(result, 'count') else len(result.data)
+            result = self.supabase.table('safetrade_trading_pairs').select('symbol').execute()
+            return len(result.data) if result.data else 0
         except Exception as e:
             logging.error(f"Ошибка получения количества торговых пар: {e}")
             return 0
-    
+
     def check_database_health(self):
         """Проверка здоровья базы данных и автоматическая очистка при необходимости"""
         try:
@@ -705,7 +682,7 @@ class DatabaseManager:
                 # Если дубликатов больше 5% от общего количества, запускаем автоматическую очистку
                 if duplicate_count > total_count * 0.05:
                     logging.info("Запуск автоматической очистки дубликатов...")
-                    if self.force_cleanup_duplicates():
+                    if self.cleanup_duplicate_trading_pairs():
                         logging.info("Автоматическая очистка завершена успешно")
                         return True
                     else:
@@ -721,7 +698,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка при проверке здоровья БД: {e}")
             return False
-    
+
     def check_connection(self):
         """Проверка соединения с Supabase"""
         try:
@@ -731,7 +708,59 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка соединения с Supabase: {e}")
             return False
+
+def test_api_permissions():
+    """Проверяет права API ключа"""
+    global api_client
     
+    # Проверяем, что api_client инициализирован
+    if not api_client:
+        logging.error("❌ API клиент не инициализирован")
+        return False
+    
+    try:
+        # Пробуем получить балансы (должно работать всегда)
+        balances = api_client.get_balances()
+        if balances is not None:
+            logging.info("✅ Чтение балансов работает")
+        else:
+            logging.warning("❌ Не удалось получить балансы")
+        
+        # Пробуем создать тестовый ордер с минимальной суммой
+        # Если ошибка "insufficient permissions", то ключ только для чтения
+        test_order = api_client.create_order(
+            market="btcusdt",
+            side="sell", 
+            amount=0.00000001,
+            order_type="market"
+        )
+        if test_order:
+            logging.info("✅ API ключ имеет права на торговлю")
+            return True
+        else:
+            logging.warning("❌ Не удалось создать тестовый ордер")
+            return False
+    except Exception as e:
+        if "permission" in str(e).lower() or "forbidden" in str(e).lower():
+            logging.error("❌ API ключ не имеет прав на торговлю!")
+            return False
+        elif "market" in str(e).lower() or "not found" in str(e).lower():
+            # Это нормально, если рынок не существует, но ключ работает
+            logging.info("✅ API ключ имеет права на торговлю (рынок не существует, но запрос прошел)")
+            return True
+        else:
+            logging.error(f"❌ Ошибка проверки прав API ключа: {e}")
+            return False
+
+    def save_trade_history_to_db(self, trade_history_client):
+        try:
+            # Простой тест соединения
+            result = self.supabase.table('safetrade_trading_pairs').select('symbol').limit(1).execute()
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка соединения с Supabase: {e}")
+            return False
+
     def execute_with_retry(self, operation, max_retries=3, delay=1):
         """Выполнение операции с повторными попытками"""
         for attempt in range(max_retries):
@@ -743,7 +772,7 @@ class DatabaseManager:
                 logging.warning(f"Попытка {attempt + 1} не удалась: {e}. Повтор через {delay} сек...")
                 time.sleep(delay)
                 delay *= 2  # Экспоненциальная задержка
-    
+
     def get_database_stats(self):
         """Получение статистики базы данных для мониторинга"""
         try:
@@ -759,26 +788,26 @@ class DatabaseManager:
             
             # Получаем количество записей в других таблицах
             try:
-                result = self.supabase.table('safetrade_price_history').select('*', count='exact').execute()
-                stats['price_history'] = result.count if hasattr(result, 'count') else len(result.data or [])
+                result = self.supabase.table('safetrade_price_history').select('*').execute()
+                stats['price_history'] = len(result.data or [])
             except:
                 pass
                 
             try:
-                result = self.supabase.table('safetrade_order_history').select('*', count='exact').execute()
-                stats['order_history'] = result.count if hasattr(result, 'count') else len(result.data or [])
+                result = self.supabase.table('safetrade_order_history').select('*').execute()
+                stats['order_history'] = len(result.data or [])
             except:
                 pass
                 
             try:
-                result = self.supabase.table('safetrade_ai_decisions').select('*', count='exact').execute()
-                stats['ai_decisions'] = result.count if hasattr(result, 'count') else len(result.data or [])
+                result = self.supabase.table('safetrade_ai_decisions').select('*').execute()
+                stats['ai_decisions'] = len(result.data or [])
             except:
                 pass
                 
             try:
-                result = self.supabase.table('safetrade_performance_metrics').select('*', count='exact').execute()
-                stats['performance_metrics'] = result.count if hasattr(result, 'count') else len(result.data or [])
+                result = self.supabase.table('safetrade_performance_metrics').select('*').execute()
+                stats['performance_metrics'] = len(result.data or [])
             except:
                 pass
             
@@ -786,7 +815,7 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Ошибка получения статистики БД: {e}")
             return None
-    
+
     def close_connection(self):
         """Безопасное закрытие соединения с базой данных"""
         try:
@@ -1028,6 +1057,7 @@ def test_api_endpoints():
         return working_endpoints
     else:
         logging.error("🚨 Не найдено ни одного работающего API эндпоинта!")
+
         return []
 
 def generate_signature(nonce, key, secret_bytes):
@@ -1209,13 +1239,56 @@ def get_markets_from_db():
         return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_sellable_balances():
-    """Получает балансы всех криптовалют кроме USDT"""
+def get_all_balances():
+    """Получает все балансы, включая исключенные валюты"""
     try:
+        logging.info("🔍 Получение всех балансов (включая исключенные)...")
+        
         # Используем новый API клиент для получения балансов
         balances = api_client.get_balances()
         
         logging.info(f"🔍 Получено балансов: {len(balances) if isinstance(balances, list) else 'не список'}")
+        if isinstance(balances, list):
+            balance_info = [{b.get('currency', 'N/A'): b.get('balance', 0)} for b in balances[:5]]
+            logging.info(f"📊 Структура балансов: {balance_info}")
+        
+        if not isinstance(balances, list):
+            logging.warning("Некорректный формат балансов")
+            return None
+        
+        # Преобразуем в словарь для удобства
+        all_balances = {}
+        for balance in balances:
+            currency = balance.get('currency', '').upper()
+            balance_amount = float(balance.get('balance', 0))
+            
+            if balance_amount > 0:  # Показываем только ненулевые балансы
+                all_balances[currency] = balance_amount
+                logging.info(f"🔍 Найден баланс {currency}: {balance_amount}")
+        
+        if all_balances:
+            logging.info(f"✅ НАЙДЕНЫ ВСЕ БАЛАНСЫ: {all_balances}")
+            return all_balances
+        else:
+            logging.warning("❌ НЕ НАЙДЕНО НЕНУЛЕВЫХ БАЛАНСОВ")
+            return None
+    except Exception as e:
+        logging.error(f"Ошибка при получении всех балансов: {e}")
+        return None
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_sellable_balances():
+    """Получает балансы всех криптовалют кроме USDT"""
+    try:
+        logging.info("🔍 НАЧАЛО ПОЛУЧЕНИЯ БАЛАНСОВ...")
+        
+        # Используем новый API клиент для получения балансов
+        balances = api_client.get_balances()
+        
+        logging.info(f"🔍 Получено балансов: {len(balances) if isinstance(balances, list) else 'не список'}")
+        if isinstance(balances, list):
+            balance_info = [{b.get('currency', 'N/A'): b.get('balance', 0)} for b in balances[:5]]
+            logging.info(f"📊 Структура балансов: {balance_info}")
         
         if not isinstance(balances, list):
             logging.warning("Некорректный формат балансов")
@@ -1241,9 +1314,9 @@ def get_sellable_balances():
             # Пропускаем исключенные валюты и нулевые балансы
             if (currency in EXCLUDED_CURRENCIES or balance_amount <= 0):
                 if currency in EXCLUDED_CURRENCIES:
-                    logging.debug(f"⏭️ Пропускаем {currency}: в списке исключенных")
+                    logging.warning(f"⏭️ ПРОПУСК {currency}: в списке исключенных {EXCLUDED_CURRENCIES}")
                 else:
-                    logging.debug(f"⏭️ Пропускаем {currency}: нулевой баланс")
+                    logging.warning(f"⏭️ ПРОПУСК {currency}: нулевой баланс ({balance_amount})")
                 continue
             
             # Проверяем allowlist - если настроен, пропускаем валюты не в списке
@@ -1269,10 +1342,11 @@ def get_sellable_balances():
                 sellable_balances[currency] = balance_amount
         
         if sellable_balances:
-            logging.info(f"Найдены продаваемые балансы: {sellable_balances}")
+            logging.info(f"✅ НАЙДЕНЫ ПРОДАВАЕМЫЕ БАЛАНСЫ: {sellable_balances}")
             return sellable_balances
-        
-        return None
+        else:
+            logging.warning("❌ НЕ НАЙДЕНО ПРОДАВАЕМЫХ БАЛАНСОВ")
+            return None
     except Exception as e:
         logging.error(f"Ошибка при получении балансов: {e}")
         return None
@@ -1551,6 +1625,7 @@ def get_market_data(symbol):
 def prioritize_sales(balances_dict):
     """Сортирует валюты по приоритету продажи"""
     priority_scores = []
+    logging.info(f"🔍 НАЧАЛО ПРИОРИТИЗАЦИИ: получено {len(balances_dict)} балансов: {list(balances_dict.keys())}")
     
     for currency, balance in balances_dict.items():
         try:
@@ -1584,6 +1659,7 @@ def prioritize_sales(balances_dict):
             
             # Пропускаем, если стоимость ниже минимальной
             if usd_value < MIN_POSITION_VALUE_USD:
+                logging.warning(f"❌ ПРОПУСК {currency}: стоимость ${usd_value:.4f} < минимальной ${MIN_POSITION_VALUE_USD}")
                 continue
             
             # В простом режиме приоритет основан только на стоимости в USD
@@ -1625,6 +1701,10 @@ def prioritize_sales(balances_dict):
     
     # Сортируем по убыванию приоритета
     priority_scores.sort(key=lambda x: x.priority_score, reverse=True)
+    
+    logging.info(f"✅ ПРИОРИТИЗАЦИЯ ЗАВЕРШЕНА: {len(priority_scores)} валют для продажи")
+    for score in priority_scores:
+        logging.info(f"   • {score.currency}: {score.balance} (${score.usd_value:.2f}) - приоритет: {score.priority_score:.3f}")
     
     return priority_scores
 
@@ -1867,27 +1947,69 @@ def extract_order_id_from_result(result_text):
         pass
     return None
 
+def round_amount_for_market(market_symbol, amount):
+    """
+    Округляет количество до допустимой точности для конкретной торговой пары.
+    Поскольку API не предоставляет информацию о точности, используем общие правила:
+    - Для большинства altcoin/USDT пар используем 8 знаков после запятой
+    - Для пар с высокой стоимостью (BTC, ETH) используем меньше знаков
+    """
+    # Список пар, которые обычно требуют меньшей точности
+    high_value_pairs = ['btcusdt', 'ethusdt']
+    
+    if market_symbol.lower() in high_value_pairs:
+        # Для BTC и ETH пробуем разные уровни точности
+        for precision in [6, 5, 4, 3, 2]:
+            formatted_amount = f"{amount:.{precision}f}"
+            rounded_amount = float(formatted_amount)
+            if rounded_amount > 0:  # Убедимся, что округленная сумма больше 0
+                return rounded_amount
+        # Если ни один уровень не подошел, используем 6 знаков
+        return float(f"{amount:.6f}")
+    else:
+        # Для остальных пар пробуем разные уровни точности
+        for precision in [8, 7, 6, 5, 4]:
+            formatted_amount = f"{amount:.{precision}f}"
+            rounded_amount = float(formatted_amount)
+            if rounded_amount > 0:  # Убедимся, что округленная сумма больше 0
+                return rounded_amount
+        # Если ни один уровень не подошел, используем 8 знаков
+        return float(f"{amount:.8f}")
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
     """Создает ордер на продажу, используя НОВЫЙ и ПРАВИЛЬНЫЙ API клиент."""
     global db_manager
     try:
+        # Округляем количество до допустимой точности
+        rounded_amount = round_amount_for_market(market_symbol, amount)
+        # Форматируем как строку с точным количеством знаков после запятой для логирования
+        if market_symbol.lower() in ['btcusdt', 'ethusdt']:
+            formatted_amount = f"{rounded_amount:.6f}"
+        else:
+            formatted_amount = f"{rounded_amount:.8f}"
+        
+        logging.info(f"🛒 НАЧАЛО СОЗДАНИЯ ОРДЕРА: {market_symbol}, количество: {amount} (округлено до: {formatted_amount}), тип: {order_type}")
+        
         # Валидация параметров
-        order_validator.validate_order_params(market_symbol, amount, order_type, price)
+        order_validator.validate_order_params(market_symbol, rounded_amount, order_type, price)
         
         # Определяем валюты из символа
         base_currency = market_symbol.replace('usdt', '').upper()
+        logging.info(f"📊 Базовая валюта: {base_currency}")
 
         # !!! ИСПОЛЬЗУЕМ НОВЫЙ КЛИЕНТ И ПРАВИЛЬНЫЕ ПАРАМЕТРЫ !!!
+        logging.info(f"📤 ОТПРАВКА ЗАПРОСА НА СОЗДАНИЕ ОРДЕРА...")
         order_details = api_client.create_order(
             market=market_symbol,
             side="sell",
-            volume=amount,          # 'volume', а не 'amount'
-            ord_type=order_type     # 'ord_type', а не 'type'
+            amount=rounded_amount,   # ✅ Используем округленное количество как float
+            order_type=order_type   # ✅ Используем 'order_type' а не 'ord_type'
         )
+        logging.info(f"📥 ПОЛУЧЕН ОТВЕТ: {order_details}")
         
         order_id = order_details.get('id')
-        order_amount = order_details.get('volume', amount)  # Используем 'volume' из ответа
+        order_amount = order_details.get('amount', rounded_amount)  # Используем 'amount' из ответа
         
         # Сохраняем данные об ордере в локальную базу
         db_manager.insert_order_history(
@@ -1895,7 +2017,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             timestamp=datetime.now().isoformat(),
             symbol=order_details.get('market', 'N/A'),
             side=order_details.get('side', 'N/A'),
-            order_type=order_details.get('ord_type', 'N/A'),  # 'ord_type' вместо 'type'
+            order_type=order_details.get('type', 'N/A'),  # ✅ Используем 'type' а не 'ord_type'
             amount=float(order_amount),
             price=float(order_details.get('price', 0)) if order_details.get('price') else None,
             total=float(order_details.get('total', 0)) if order_details.get('total') else None,
@@ -1909,22 +2031,117 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             f"✅ *Успешно размещен ордер на продажу!*\n\n"
             f"*Биржа:* SafeTrade\n"
             f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
-            f"*Тип:* `{order_details.get('ord_type', 'N/A').capitalize()}`\n"
+            f"*Тип:* `{order_details.get('type', 'N/A').capitalize()}`\n"  # ✅ Используем 'type' а не 'ord_type'
             f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
             f"*Заявленный объем:* `{order_amount} {base_currency}`\n"
             f"*ID ордера:* `{order_id}`"
         )
+    except requests.exceptions.HTTPError as e:
+        # Обрабатываем специфичную ошибку "market.order.non_round_amount"
+        return handle_precision_error(market_symbol, amount, order_type, price, e)
     except Exception as e:
-        error_message = f"❌ Ошибка при создании ордера на продажу: {e}"
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_details = e.response.json()  # API отвечает в JSON
-                error_msg = error_details.get('errors', [str(error_details)])
-                error_message += f"\nОтвет сервера: `{json.dumps(error_msg)}`"
-            except:
-                error_message += f"\nОтвет сервера: `{e.response.text}`"
-        logging.error(error_message)
-        return error_message
+        # Проверяем, является ли это ошибкой точности
+        if "market.order.non_round_amount" in str(e):
+            return handle_precision_error(market_symbol, amount, order_type, price, e)
+        else:
+            # Другая ошибка
+            error_message = f"❌ Ошибка при создании ордера на продажу: {e}"
+            logging.error(f"🚨 ДЕТАЛЬНАЯ ОШИБКА СОЗДАНИЯ ОРДЕРА:")
+            logging.error(f"   • Тип ошибки: {type(e).__name__}")
+            logging.error(f"   • Сообщение: {str(e)}")
+            
+            if hasattr(e, 'response') and e.response is not None:
+                logging.error(f"   • HTTP статус: {e.response.status_code}")
+                logging.error(f"   • Заголовки: {dict(e.response.headers)}")
+                try:
+                    error_details = e.response.json()  # API отвечает в JSON
+                    error_msg = error_details.get('errors', [str(error_details)])
+                    logging.error(f"   • JSON ответ: {json.dumps(error_details, indent=2)}")
+                    error_message += f"\nОтвет сервера: `{json.dumps(error_msg)}`"
+                except:
+                    logging.error(f"   • Текст ответа: {e.response.text}")
+                    error_message += f"\nОтвет сервера: `{e.response.text}`"
+            else:
+                logging.error(f"   • Нет ответа от сервера")
+            
+            logging.error(error_message)
+            return error_message
+
+def handle_precision_error(market_symbol, amount, order_type, price, original_error):
+    """Обрабатывает ошибку точности и пробует разные уровни точности"""
+    logging.warning(f"Получена ошибка точности для {market_symbol}, пробуем другие уровни точности...")
+    
+    # Пробуем разные уровни точности
+    precision_levels = [8, 7, 6, 5, 4, 3, 2] if market_symbol.lower() not in ['btcusdt', 'ethusdt'] else [6, 5, 4, 3, 2]
+    
+    for precision in precision_levels:
+        try:
+            # Форматируем с новым уровнем точности
+            formatted_amount = f"{amount:.{precision}f}"
+            new_rounded_amount = float(formatted_amount)
+            
+            logging.info(f"Пробуем точность {precision}: {new_rounded_amount}")
+            
+            # Проверяем, что новая сумма больше 0
+            if new_rounded_amount <= 0:
+                continue
+            
+            # Пытаемся создать ордер с новой точностью
+            order_details = api_client.create_order(
+                market=market_symbol,
+                side="sell",
+                amount=new_rounded_amount,
+                order_type=order_type
+            )
+            
+            logging.info(f"✅ Успешно создан ордер с точностью {precision}")
+            
+            # Обработка успешного результата
+            return handle_successful_order(order_details, market_symbol)
+        except Exception as precision_error:
+            logging.warning(f"Не удалось создать ордер с точностью {precision}: {precision_error}")
+            continue
+    
+    # Если ни один уровень точности не сработал
+    error_message = f"❌ Не удалось создать ордер для {market_symbol} - ни один уровень точности не подошел"
+    logging.error(error_message)
+    return error_message
+
+def handle_successful_order(order_details, market_symbol):
+    """Обрабатывает успешное создание ордера"""
+    global db_manager
+    
+    order_id = order_details.get('id')
+    order_amount = order_details.get('amount', order_details.get('volume', 0))  # Используем 'amount' или 'volume' из ответа
+    
+    # Определяем валюты из символа
+    base_currency = market_symbol.replace('usdt', '').upper()
+    
+    # Сохраняем данные об ордере в локальную базу
+    db_manager.insert_order_history(
+        order_id=order_id,
+        timestamp=datetime.now().isoformat(),
+        symbol=order_details.get('market', 'N/A'),
+        side=order_details.get('side', 'N/A'),
+        order_type=order_details.get('type', 'N/A'),
+        amount=float(order_amount),
+        price=float(order_details.get('price', 0)) if order_details.get('price') else None,
+        total=float(order_details.get('total', 0)) if order_details.get('total') else None,
+        status=order_details.get('state', 'N/A')
+    )
+    
+    if order_id:
+        threading.Thread(target=track_order, args=(order_id,)).start()
+    
+    return (
+        f"✅ *Успешно размещен ордер на продажу!*\n\n"
+        f"*Биржа:* SafeTrade\n"
+        f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
+        f"*Тип:* `{order_details.get('type', 'N/A').capitalize()}`\n"
+        f"*Сторона:* `{order_details.get('side', 'N/A').capitalize()}`\n"
+        f"*Заявленный объем:* `{order_amount} {base_currency}`\n"
+        f"*ID ордера:* `{order_id}`"
+    )
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def track_order_execution(order_id, timeout=300):
@@ -2039,8 +2256,8 @@ def cancel_order(order_id):
     global db_manager
     try:
         # Используем новый API клиент для отмены ордера
-        api_client.cancel_order(order_id)
-        logging.info(f"Ордер {order_id} отменён")
+        result = api_client.cancel_order(order_id)
+        logging.info(f"Ордер {order_id} отменён: {result}")
         
         # Обновляем статус в базе данных
         db_manager.update_order_status(
@@ -2056,9 +2273,8 @@ def check_order_exists(order_id):
     """Проверяет существование ордера"""
     try:
         # Используем новый API клиент для проверки существования ордера
-        # Сначала получаем все ордера и ищем нужный
-        orders = api_client.get_orders()
-        return any(order.get('id') == order_id for order in orders)
+        order = get_order_details(order_id)
+        return order is not None
     except Exception as e:
         logging.error(f"Ошибка проверки существования ордера {order_id}: {e}")
         return False
@@ -2067,10 +2283,9 @@ def get_order_status(order_id):
     """Получает статус ордера"""
     try:
         # Используем новый API клиент для получения статуса ордера
-        orders = api_client.get_orders()
-        for order in orders:
-            if order.get('id') == order_id:
-                return order.get('state', 'unknown')
+        order = get_order_details(order_id)
+        if order:
+            return order.get('state', 'unknown')
         
         logging.warning(f"Ордер {order_id} не найден")
         return 'not_found'
@@ -2082,10 +2297,18 @@ def get_order_details(order_id):
     """Получает детальную информацию об ордере"""
     try:
         # Используем новый API клиент для получения деталей ордера
-        orders = api_client.get_orders()
-        for order in orders:
-            if order.get('id') == order_id:
+        # Пробуем получить конкретный ордер по ID
+        try:
+            order = api_client.get(f"/market/orders/{order_id}")
+            if order:
                 return order
+        except:
+            # Если не удалось получить по ID, получаем все ордера и ищем нужный
+            orders = api_client.get_orders()
+            if isinstance(orders, list):
+                for order in orders:
+                    if str(order.get('id')) == str(order_id):
+                        return order
         
         return None
     except Exception as e:
@@ -2125,9 +2348,10 @@ def cancel_all_active_orders():
         # Используем новый API клиент для получения всех ордеров
         orders = api_client.get_orders()
         
-        for order in orders:
-            if order.get('state') in ['wait', 'pending']:
-                cancel_order(order.get('id'))
+        if isinstance(orders, list):
+            for order in orders:
+                if order.get('state') in ['wait', 'pending']:
+                    cancel_order(order.get('id'))
         
         logging.info("Все активные ордера отменены")
     except Exception as e:
@@ -2141,7 +2365,7 @@ def save_cache_state():
             "prices": prices_cache,
             "timestamp": time.time()
         }
-        with open("/app/data/cache_state.json", "w") as f:
+        with open(log_dir / "cache_state.json", "w") as f:
             json.dump(cache_state, f, default=str)
         logging.info("Состояние кэша сохранено")
     except Exception as e:
@@ -2150,7 +2374,7 @@ def save_cache_state():
 def load_cache_state():
     """Загружает состояние кэша при запуске"""
     try:
-        cache_file = Path("/app/data/cache_state.json")
+        cache_file = log_dir / "cache_state.json"
         if cache_file.exists():
             with open(cache_file, "r") as f:
                 cache_state = json.load(f)
@@ -2429,30 +2653,46 @@ if bot:
     def show_balance(message):
         """Показывает текущие балансы"""
         try:
-            balances = get_sellable_balances()
-            if not balances:
+            # Получаем все балансы (включая исключенные валюты)
+            all_balances = get_all_balances()
+            if not all_balances:
                 bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
                 return
             
-            priority_scores = prioritize_sales(balances)
-            
+            # Форматируем ответ с отображением всех балансов
             response = "💰 *Ваши балансы:*\n\n"
             total_usd = 0
+            displayed_balances = []
             
-            for i, score in enumerate(priority_scores, 1):
-                total_usd += score.usd_value
-                # Escape special Markdown characters
-                currency = str(score.currency).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
-                response += (
-                    f"{i}. *{currency}*\n"
-                    f"   • Количество: `{score.balance:.8f}`\n"
-                    f"   • Цена: `${score.market_data.current_price:.6f}`\n"
-                    f"   • Стоимость: `${score.usd_value:.2f}`\n"
-                    f"   • Приоритет: `{score.priority_score:.3f}`\n"
-                    f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
-                )
+            # Сначала показываем USDT отдельно
+            usdt_balance = all_balances.get('USDT', 0)
+            if usdt_balance > 0:
+                response += f"🔹 *USDT*\n   • Количество: `{usdt_balance:.8f}`\n\n"
             
-            response += f"💵 *Общая стоимость: ${total_usd:.2f}*"
+            # Затем показываем остальные балансы с приоритетом продажи
+            priority_scores = prioritize_sales({k: v for k, v in all_balances.items() if k != 'USDT' and k not in EXCLUDED_CURRENCIES and v > 0})
+            
+            if priority_scores:
+                for i, score in enumerate(priority_scores, 1):
+                    total_usd += score.usd_value
+                    # Escape special Markdown characters
+                    currency = str(score.currency).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
+                    response += (
+                        f"{i}. *{currency}*\n"
+                        f"   • Количество: `{score.balance:.8f}`\n"
+                        f"   • Цена: `${score.market_data.current_price:.6f}`\n"
+                        f"   • Стоимость: `${score.usd_value:.2f}`\n"
+                        f"   • Приоритет: `{score.priority_score:.3f}`\n"
+                        f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
+                    )
+            else:
+                # Если нет приоритетных балансов, просто показываем остальные
+                for currency, balance in all_balances.items():
+                    if currency != 'USDT' and currency not in EXCLUDED_CURRENCIES and balance > 0:
+                        response += f"🔹 *{currency}*\n   • Количество: `{balance:.8f}`\n\n"
+            
+            # Добавляем общую стоимость (без учета USDT)
+            response += f"💵 *Общая стоимость активов: ${total_usd:.2f}*"
             
             bot.reply_to(message, response, parse_mode='Markdown')
         
@@ -2460,6 +2700,30 @@ if bot:
             logging.error(f"Ошибка в show_balance: {e}")
             bot.reply_to(message, f"❌ Ошибка получения балансов: {e}")
 
+    @bot.message_handler(commands=['balancee'])
+    def show_usdt_balance(message):
+        """Показывает только баланс USDT на аккаунте"""
+        try:
+            # Получаем все балансы
+            all_balances = get_all_balances()
+            if not all_balances:
+                bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
+                return
+            
+            # Получаем баланс USDT
+            usdt_balance = all_balances.get('USDT', 0)
+            
+            # Формируем ответ только с балансом USDT
+            response = "💰 *Баланс USDT:*\n\n"
+            response += f"🔹 *USDT*: `{usdt_balance:.8f}`\n\n"
+            response += f"💵 *Всего USDT*: ${usdt_balance:.2f}"
+            
+            bot.reply_to(message, response, parse_mode='Markdown')
+        
+        except Exception as e:
+            logging.error(f"Ошибка в show_usdt_balance: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения баланса USDT: {e}")
+    
     @bot.message_handler(commands=['sell_all'])
     def sell_all_altcoins(message):
         """Продает все альткоины"""
@@ -2860,13 +3124,19 @@ def main():
             logging.info(f"🧠 ИИ-помощник включен (из config.yml).")
 
         test_api_endpoints()
+        if api_client:
+            test_api_permissions()  # Добавляем проверку прав API ключа
         
         # Инициализируем менеджер базы данных
         logging.info("🔍 Проверка здоровья базы данных при запуске...")
         try:
-            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-            db_manager = DatabaseManager(supabase)
-            db_manager.check_database_health()
+            if SUPABASE_URL and SUPABASE_KEY:
+                supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+                db_manager = DatabaseManager(supabase)
+                db_manager.check_database_health()
+            else:
+                logging.error("❌ Supabase URL или ключ не настроены")
+                return
         except Exception as e:
             logging.error(f"❌ Ошибка инициализации базы данных: {e}")
             return
