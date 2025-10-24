@@ -100,10 +100,10 @@ class SafeTradeAPI:
             try:
                 result = self.get(endpoint)
                 if result:
-                    logging.info(f"✅ Балансы получены через эндпоинт: {endpoint}")
+                    logging.debug(f"✅ Балансы получены через эндпоинт: {endpoint}")
                     return result
             except Exception as e:
-                logging.warning(f"❌ Эндпоинт {endpoint} не сработал: {e}")
+                logging.debug(f"❌ Эндпоинт {endpoint} не сработал: {e}")
                 continue
         
         logging.error("❌ Не удалось получить балансы через ни один из известных эндпоинтов")
@@ -1309,14 +1309,18 @@ def get_sellable_balances():
             currency = balance.get('currency', '').upper()
             balance_amount = float(balance.get('balance', 0))
             
-            logging.info(f"🔍 Проверяем баланс {currency}: {balance_amount}")
+            # В EASY_MODE показываем логи только для валют с балансом > 0
+            if balance_amount > 0:
+                logging.info(f"🔍 Проверяем баланс {currency}: {balance_amount}")
             
             # Пропускаем исключенные валюты и нулевые балансы
             if (currency in EXCLUDED_CURRENCIES or balance_amount <= 0):
                 if currency in EXCLUDED_CURRENCIES:
-                    logging.warning(f"⏭️ ПРОПУСК {currency}: в списке исключенных {EXCLUDED_CURRENCIES}")
+                    logging.debug(f"⏭️ ПРОПУСК {currency}: в списке исключенных {EXCLUDED_CURRENCIES}")
                 else:
-                    logging.warning(f"⏭️ ПРОПУСК {currency}: нулевой баланс ({balance_amount})")
+                    # В EASY_MODE не логируем нулевые балансы совсем
+                    if not EASY_MODE:
+                        logging.debug(f"⏭️ ПРОПУСК {currency}: нулевой баланс ({balance_amount})")
                 continue
             
             # Проверяем allowlist - если настроен, пропускаем валюты не в списке
@@ -1719,7 +1723,7 @@ def execute_trading_strategy(priority_score: PriorityScore, ai_decision: "Tradin
         
         # В ПРОСТОМ РЕЖИМЕ ВСЕГДА ПРОДАЕМ ПО РЫНКУ
         if EASY_MODE:
-            logging.info(f"Easy Mode: Исполняем рыночную продажу для {priority_score.currency}")
+            logging.info(f"🤖 Easy Mode: Рыночная продажа {priority_score.currency} ({amount:.8f})")
             return execute_market_sell(market_symbol, amount)
 
         # Используем стандартную логику выбора стратегии для сложного режима
@@ -1791,7 +1795,18 @@ def execute_market_sell(market_symbol, amount):
     """Исполнение рыночной продажи"""
     try:
         result = create_sell_order_safetrade(market_symbol, amount, "market")
-        return "✅" in result
+        # Проверяем успешность создания ордера
+        if result and isinstance(result, str):
+            success = "✅" in result and "Успешно размещен ордер" in result
+            if success:
+                logging.info(f"✅ Рыночный ордер для {market_symbol} успешно создан")
+                return True
+            else:
+                logging.warning(f"❌ Не удалось создать рыночный ордер для {market_symbol}: {result}")
+                return False
+        else:
+            logging.error(f"❌ Некорректный ответ от create_sell_order_safetrade для {market_symbol}: {result}")
+            return False
     except Exception as e:
         logging.error(f"Ошибка рыночной продажи {market_symbol}: {e}")
         return False
@@ -1800,7 +1815,18 @@ def execute_limit_sell(market_symbol, amount, price):
     """Исполнение лимитной продажи"""
     try:
         result = create_sell_order_safetrade(market_symbol, amount, "limit", price)
-        return "✅" in result
+        # Проверяем успешность создания ордера
+        if result and isinstance(result, str):
+            success = "✅" in result and "Успешно размещен ордер" in result
+            if success:
+                logging.info(f"✅ Лимитный ордер для {market_symbol} успешно создан")
+                return True
+            else:
+                logging.warning(f"❌ Не удалось создать лимитный ордер для {market_symbol}: {result}")
+                return False
+        else:
+            logging.error(f"❌ Некорректный ответ от create_sell_order_safetrade для {market_symbol}: {result}")
+            return False
     except Exception as e:
         logging.error(f"Ошибка лимитной продажи {market_symbol}: {e}")
         return False
@@ -1826,7 +1852,7 @@ def execute_twap_sell(market_symbol, total_amount, duration_minutes=60, chunks=6
             limit_price = current_price * 1.001
             result = create_sell_order_safetrade(market_symbol, chunk_amount, "limit", limit_price)
             
-            if "✅" in result:
+            if result and isinstance(result, str) and "✅" in result and "Успешно размещен ордер" in result:
                 successful_chunks += 1
                 order_id = extract_order_id_from_result(result)
                 if order_id:
@@ -1868,7 +1894,7 @@ def execute_iceberg_sell(market_symbol, total_amount, visible_ratio=0.1, max_att
             # Размещаем лимитный ордер
             result = create_sell_order_safetrade(market_symbol, current_visible, "limit", best_bid)
             
-            if "✅" in result:
+            if result and isinstance(result, str) and "✅" in result and "Успешно размещен ордер" in result:
                 successful_orders += 1
                 remaining -= current_visible
                 order_id = extract_order_id_from_result(result)
@@ -1920,7 +1946,7 @@ def execute_adaptive_sell(market_symbol, total_amount):
             
             if order_size > 0:
                 result = create_sell_order_safetrade(market_symbol, order_size, "limit", price)
-                if "✅" in result:
+                if result and isinstance(result, str) and "✅" in result and "Успешно размещен ордер" in result:
                     placed_orders += 1
                     remaining -= order_size
                     order_id = extract_order_id_from_result(result)
@@ -1930,7 +1956,7 @@ def execute_adaptive_sell(market_symbol, total_amount):
         # Если остались неразмещенные средства, используем рыночный ордер
         if remaining > 0:
             result = create_sell_order_safetrade(market_symbol, remaining, "market")
-            if "✅" in result:
+            if result and isinstance(result, str) and "✅" in result and "Успешно размещен ордер" in result:
                 placed_orders += 1
         
         return placed_orders > 0
@@ -2000,13 +2026,27 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
 
         # !!! ИСПОЛЬЗУЕМ НОВЫЙ КЛИЕНТ И ПРАВИЛЬНЫЕ ПАРАМЕТРЫ !!!
         logging.info(f"📤 ОТПРАВКА ЗАПРОСА НА СОЗДАНИЕ ОРДЕРА...")
-        order_details = api_client.create_order(
-            market=market_symbol,
-            side="sell",
-            amount=rounded_amount,   # ✅ Используем округленное количество как float
-            order_type=order_type   # ✅ Используем 'order_type' а не 'ord_type'
-        )
-        logging.info(f"📥 ПОЛУЧЕН ОТВЕТ: {order_details}")
+        logging.info(f"   • Параметры: market={market_symbol}, side=sell, amount={rounded_amount}, type={order_type}")
+        
+        try:
+            order_details = api_client.create_order(
+                market=market_symbol,
+                side="sell",
+                amount=rounded_amount,   # ✅ Используем округленное количество как float
+                order_type=order_type   # ✅ Используем 'order_type' а не 'ord_type'
+            )
+            logging.info(f"📥 ПОЛУЧЕН ОТВЕТ: {order_details}")
+        except Exception as api_error:
+            logging.error(f"🚨 ОШИБКА API ПРИ СОЗДАНИИ ОРДЕРА: {api_error}")
+            # Пробуем получить больше деталей об ошибке
+            if hasattr(api_error, 'response') and api_error.response is not None:
+                logging.error(f"   • HTTP статус: {api_error.response.status_code}")
+                try:
+                    error_details = api_error.response.json()
+                    logging.error(f"   • Детали ошибки: {json.dumps(error_details, indent=2)}")
+                except:
+                    logging.error(f"   • Текст ответа: {api_error.response.text}")
+            raise api_error
         
         order_id = order_details.get('id')
         order_amount = order_details.get('amount', rounded_amount)  # Используем 'amount' из ответа
@@ -2027,7 +2067,7 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
         if order_id:
             threading.Thread(target=track_order, args=(order_id,)).start()
         
-        return (
+        success_message = (
             f"✅ *Успешно размещен ордер на продажу!*\n\n"
             f"*Биржа:* SafeTrade\n"
             f"*Пара:* `{order_details.get('market', 'N/A').upper()}`\n"
@@ -2036,12 +2076,16 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             f"*Заявленный объем:* `{order_amount} {base_currency}`\n"
             f"*ID ордера:* `{order_id}`"
         )
+        logging.info(f"✅ Ордер успешно создан: {order_id}")
+        return success_message
     except requests.exceptions.HTTPError as e:
         # Обрабатываем специфичную ошибку "market.order.non_round_amount"
+        logging.error(f"🚨 HTTP ошибка при создании ордера: {e}")
         return handle_precision_error(market_symbol, amount, order_type, price, e)
     except Exception as e:
         # Проверяем, является ли это ошибкой точности
         if "market.order.non_round_amount" in str(e):
+            logging.error(f"🚨 Ошибка точности при создании ордера: {e}")
             return handle_precision_error(market_symbol, amount, order_type, price, e)
         else:
             # Другая ошибка
