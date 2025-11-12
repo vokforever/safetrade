@@ -109,15 +109,18 @@ class SafeTradeAPI:
         logging.error("❌ Не удалось получить балансы через ни один из известных эндпоинтов")
         return None
 
-    def create_order(self, market: str, side: str, amount: float, order_type: str, price: Optional[float] = None):
+    def create_order(self, market: str, side: str, amount, order_type: str, price: Optional[float] = None):
         """
         Creates a new order with CORRECT parameters.
         Note the parameter names: 'amount' and 'type'.
         """
+        # ✅ ИСПРАВЛЕНО: Убедимся, что amount всегда передается как строка
+        amount_str = str(amount) if not isinstance(amount, str) else amount
+        
         payload = {
             "market": market,
             "side": side,
-            "amount": str(amount),  # ✅ Use 'amount' not 'volume'
+            "amount": amount_str,  # ✅ Use 'amount' not 'volume', ensure it's a string
             "type": order_type,     # ✅ Use 'type' not 'ord_type'
         }
         if order_type == "limit" and price:
@@ -1794,7 +1797,37 @@ def execute_trading_strategy(priority_score: PriorityScore, ai_decision: "Tradin
 def execute_market_sell(market_symbol, amount):
     """Исполнение рыночной продажи"""
     try:
-        result = create_sell_order_safetrade(market_symbol, amount, "market")
+        # Для NOCK используем специальную обработку
+        if "nock" in market_symbol.lower():
+            # Округляем количество до допустимой точности
+            rounded_amount = round_amount_for_market(market_symbol, amount)
+            # Дополнительно округляем для NOCK до 4 знаков после запятой
+            rounded_amount = round(rounded_amount, 4)
+            logging.info(f"Дополнительно округляем NOCK до 4 знаков: {rounded_amount}")
+            
+            # Пробуем создать ордер
+            result = create_sell_order_safetrade(market_symbol, rounded_amount, "market")
+            
+            # Если ошибка insufficient_balance, пробуем с меньшей суммой
+            if result and isinstance(result, str) and "insufficient_balance" in result:
+                logging.warning(f"Ошибка insufficient_balance для NOCK, пробуем с 95% от суммы")
+                reduced_amount = rounded_amount * 0.95
+                reduced_amount = round(reduced_amount, 4)
+                logging.info(f"Пробуем с уменьшенной суммой: {reduced_amount}")
+                result = create_sell_order_safetrade(market_symbol, reduced_amount, "market")
+            
+            # Если все еще ошибка, пробуем еще меньше
+            if result and isinstance(result, str) and "insufficient_balance" in result:
+                logging.warning(f"Все еще ошибка insufficient_balance, пробуем с 90% от суммы")
+                reduced_amount = rounded_amount * 0.9
+                reduced_amount = round(reduced_amount, 4)
+                logging.info(f"Пробуем с еще меньшей суммой: {reduced_amount}")
+                result = create_sell_order_safetrade(market_symbol, reduced_amount, "market")
+        else:
+            # Для других валют стандартная обработка
+            rounded_amount = round_amount_for_market(market_symbol, amount)
+            result = create_sell_order_safetrade(market_symbol, rounded_amount, "market")
+        
         # Проверяем успешность создания ордера
         if result and isinstance(result, str):
             success = "✅" in result and "Успешно размещен ордер" in result
@@ -1976,39 +2009,96 @@ def extract_order_id_from_result(result_text):
 def round_amount_for_market(market_symbol, amount):
     """
     Округляет количество до допустимой точности для конкретной торговой пары.
-    Поскольку API не предоставляет информацию о точности, используем общие правила:
-    - Для большинства altcoin/USDT пар используем 8 знаков после запятой
-    - Для пар с высокой стоимостью (BTC, ETH) используем меньше знаков
+    Использует информацию о точности из API рынка.
     """
-    # Список пар, которые обычно требуют меньшей точности
-    high_value_pairs = ['btcusdt', 'ethusdt']
-    
-    if market_symbol.lower() in high_value_pairs:
-        # Для BTC и ETH пробуем разные уровни точности
-        for precision in [6, 5, 4, 3, 2]:
-            formatted_amount = f"{amount:.{precision}f}"
-            rounded_amount = float(formatted_amount)
-            if rounded_amount > 0:  # Убедимся, что округленная сумма больше 0
-                return rounded_amount
-        # Если ни один уровень не подошел, используем 6 знаков
-        return float(f"{amount:.6f}")
-    else:
-        # Для остальных пар пробуем разные уровни точности
-        for precision in [8, 7, 6, 5, 4]:
-            formatted_amount = f"{amount:.{precision}f}"
-            rounded_amount = float(formatted_amount)
-            if rounded_amount > 0:  # Убедимся, что округленная сумма больше 0
-                return rounded_amount
-        # Если ни один уровень не подошел, используем 8 знаков
-        return float(f"{amount:.8f}")
+    try:
+        # Получаем информацию о всех рынках
+        markets = get_all_markets()
+        if not markets:
+            logging.warning(f"Не удалось получить рынки, используем стандартную точность для {market_symbol}")
+            return float(f"{amount:.4f}")  # Стандартная точность
+        
+        # Ищем информацию о нужном рынке
+        market_info = None
+        for market in markets:
+            if market.get('id', '').lower() == market_symbol.lower():
+                market_info = market
+                break
+        
+        if not market_info:
+            logging.warning(f"Не найдена информация о рынке {market_symbol}, используем стандартную точность")
+            return float(f"{amount:.4f}")  # Стандартная точность
+        
+        # Получаем точность из информации о рынке
+        amount_precision = market_info.get('amount_precision', 4)
+        min_amount = float(market_info.get('min_amount', 0.01))
+        
+        logging.info(f"Информация о рынке {market_symbol}: точность={amount_precision}, мин. количество={min_amount}")
+        
+        # Округляем до нужной точности
+        formatted_amount = f"{amount:.{amount_precision}f}"
+        rounded_amount = float(formatted_amount)
+        
+        # Проверяем, что округленная сумма не меньше минимальной
+        if rounded_amount < min_amount:
+            logging.warning(f"Округленная сумма {rounded_amount} меньше минимальной {min_amount}")
+            # ✅ ИСПРАВЛЕНО: Возвращаем минимальную сумму вместо None
+            logging.info(f"Используем минимальную сумму {min_amount} вместо {rounded_amount}")
+            return min_amount
+        
+        logging.info(f"Сумма {amount} округлена до {rounded_amount} с точностью {amount_precision}")
+        return rounded_amount
+        
+    except Exception as e:
+        logging.error(f"Ошибка при округлении суммы для {market_symbol}: {e}")
+        # В случае ошибки используем стандартную точность
+        return float(f"{amount:.4f}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
     """Создает ордер на продажу, используя НОВЫЙ и ПРАВИЛЬНЫЙ API клиент."""
     global db_manager
     try:
+        # Получаем информацию о рынке для проверки минимального размера ордера
+        markets = get_all_markets()
+        market_info = None
+        if markets:
+            for market in markets:
+                if market.get('id', '').lower() == market_symbol.lower():
+                    market_info = market
+                    break
+        
+        # Получаем текущую цену
+        current_price = get_ticker_price(market_symbol)
+        if not current_price:
+            logging.error(f"Не удалось получить цену для {market_symbol}")
+            return None
+        
         # Округляем количество до допустимой точности
         rounded_amount = round_amount_for_market(market_symbol, amount)
+        
+        if rounded_amount is None:
+            error_message = f"❌ Не удалось округлить сумму {amount} до допустимой точности для {market_symbol}"
+            logging.error(error_message)
+            return error_message
+        
+        # Проверяем минимальный размер ордера в USD
+        if market_info:
+            min_amount = float(market_info.get('min_amount', 0.01))
+            min_order_usd = min_amount * current_price
+            
+            order_usd = rounded_amount * current_price
+            
+            logging.info(f"📊 Проверка ордера для {market_symbol}:")
+            logging.info(f"   • Сумма ордера: {rounded_amount} {market_symbol}")
+            logging.info(f"   • Стоимость ордера: ${order_usd:.6f}")
+            logging.info(f"   • Минимальная стоимость: ${min_order_usd:.6f}")
+            
+            if order_usd < min_order_usd:
+                error_message = f"❌ Стоимость ордера ${order_usd:.6f} меньше минимальной ${min_order_usd:.6f} для {market_symbol}"
+                logging.error(error_message)
+                return error_message
+        
         # Форматируем как строку с точным количеством знаков после запятой для логирования
         if market_symbol.lower() in ['btcusdt', 'ethusdt']:
             formatted_amount = f"{rounded_amount:.6f}"
@@ -2029,10 +2119,11 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
         logging.info(f"   • Параметры: market={market_symbol}, side=sell, amount={rounded_amount}, type={order_type}")
         
         try:
+            # ✅ ИСПРАВЛЕНО: Передаем amount как строку, как в примере API
             order_details = api_client.create_order(
                 market=market_symbol,
                 side="sell",
-                amount=rounded_amount,   # ✅ Используем округленное количество как float
+                amount=str(rounded_amount),   # ✅ Передаем amount как строку
                 order_type=order_type   # ✅ Используем 'order_type' а не 'ord_type'
             )
             logging.info(f"📥 ПОЛУЧЕН ОТВЕТ: {order_details}")
@@ -2115,7 +2206,48 @@ def handle_precision_error(market_symbol, amount, order_type, price, original_er
     """Обрабатывает ошибку точности и пробует разные уровни точности"""
     logging.warning(f"Получена ошибка точности для {market_symbol}, пробуем другие уровни точности...")
     
-    # Пробуем разные уровни точности
+    try:
+        # Получаем информацию о точности из рынка
+        markets = get_all_markets()
+        if markets:
+            for market in markets:
+                if market.get('id', '').lower() == market_symbol.lower():
+                    amount_precision = market.get('amount_precision', 4)
+                    min_amount = float(market.get('min_amount', 0.01))
+                    
+                    logging.info(f"Используем точность из API: {amount_precision} знаков, мин. сумма: {min_amount}")
+                    
+                    # Округляем до правильной точности
+                    formatted_amount = f"{amount:.{amount_precision}f}"
+                    new_rounded_amount = float(formatted_amount)
+                    
+                    # Проверяем, что сумма не меньше минимальной
+                    if new_rounded_amount < min_amount:
+                        error_message = f"❌ Сумма {new_rounded_amount} меньше минимальной {min_amount} для {market_symbol}"
+                        logging.error(error_message)
+                        return error_message
+                    
+                    try:
+                        # ✅ ИСПРАВЛЕНО: Передаем amount как строку, как в примере API
+                        order_details = api_client.create_order(
+                            market=market_symbol,
+                            side="sell",
+                            amount=str(new_rounded_amount),  # ✅ Передаем amount как строку
+                            order_type=order_type
+                        )
+                        
+                        logging.info(f"✅ Успешно создан ордер с точностью {amount_precision}")
+                        
+                        # Обработка успешного результата
+                        return handle_successful_order(order_details, market_symbol)
+                    except Exception as precision_error:
+                        logging.warning(f"Не удалось создать ордер с точностью {amount_precision}: {precision_error}")
+                        # Если не получилось с правильной точностью, пробуем другие
+                        break
+    except Exception as e:
+        logging.warning(f"Не удалось получить информацию о точности для {market_symbol}: {e}")
+    
+    # Если не получилось с информацией из API, пробуем стандартные уровни точности
     precision_levels = [8, 7, 6, 5, 4, 3, 2] if market_symbol.lower() not in ['btcusdt', 'ethusdt'] else [6, 5, 4, 3, 2]
     
     for precision in precision_levels:
@@ -2130,11 +2262,11 @@ def handle_precision_error(market_symbol, amount, order_type, price, original_er
             if new_rounded_amount <= 0:
                 continue
             
-            # Пытаемся создать ордер с новой точностью
+            # ✅ ИСПРАВЛЕНО: Передаем amount как строку, как в примере API
             order_details = api_client.create_order(
                 market=market_symbol,
                 side="sell",
-                amount=new_rounded_amount,
+                amount=str(new_rounded_amount),  # ✅ Передаем amount как строку
                 order_type=order_type
             )
             
@@ -2474,25 +2606,111 @@ def auto_sell_all_altcoins():
                 try:
                     logging.info(f"Обработка {score.currency}: {score.balance} (${score.usd_value:.2f})")
                     
-                    ai_decision = None
-                    # Получаем решение ИИ, только если он включен и мы не в простом режиме
-                    if AI_ENABLED and not EASY_MODE and cerebras_client:
-                        ai_decision = ai_assistant.get_ai_trading_decision(
-                            score.currency,
-                            score.balance,
-                            score.market_data,
-                            db_manager  # Передаем db_manager
-                        )
-                    
-                    # Исполняем торговую стратегию
-                    success = execute_trading_strategy(score, ai_decision)
-                    
-                    if success:
-                        successful_sales += 1
-                        logging.info(f"✅ Успешно продан {score.currency}")
+                    # В простом режиме разбиваем большие ордера на несколько частей
+                    if EASY_MODE:
+                        # Для NOCK всегда используем множественные ордера из-за особенностей биржи
+                        if score.currency == "NOCK" or score.balance > 100:
+                            # Определяем количество частей в зависимости от размера баланса
+                            if score.balance > 500:
+                                num_parts = 5
+                            elif score.balance > 200:
+                                num_parts = 3
+                            else:
+                                num_parts = 2
+                            
+                            # Используем 99% от баланса, чтобы избежать ошибки insufficient_balance
+                            adjusted_balance = score.balance * 0.99
+                            part_size = adjusted_balance / num_parts
+                            
+                            logging.info(f"Разбиваем {score.currency} на {num_parts} части по {part_size:.4f} каждая (используем 99% от баланса)")
+                            
+                            part_success = 0
+                            for i in range(num_parts):
+                                try:
+                                    # Создаем новый объект PriorityScore для части
+                                    part_score = PriorityScore(
+                                        currency=score.currency,
+                                        balance=part_size,
+                                        usd_value=part_size * score.market_data.current_price,
+                                        priority_score=score.priority_score,
+                                        market_data=score.market_data
+                                    )
+                                    
+                                    # Исполняем торговую стратегию для части
+                                    part_success_result = execute_trading_strategy(part_score, None)
+                                    if part_success_result:
+                                        part_success += 1
+                                        logging.info(f"✅ Успешно продана часть {i+1}/{num_parts} {score.currency}")
+                                    else:
+                                        logging.warning(f"❌ Не удалось продать часть {i+1}/{num_parts} {score.currency}")
+                                    
+                                    # Небольшая задержка между частями
+                                    time.sleep(1)
+                                except Exception as part_error:
+                                    logging.error(f"Ошибка при продаже части {i+1}/{num_parts} {score.currency}: {part_error}")
+                            
+                            # Если хотя бы одна часть успешно продана, считаем продажу успешной
+                            if part_success > 0:
+                                successful_sales += 1
+                                logging.info(f"✅ Успешно продано {part_success}/{num_parts} частей {score.currency}")
+                            else:
+                                failed_sales += 1
+                                logging.warning(f"❌ Не удалось продать ни одной части {score.currency}")
+                        else:
+                            # Для малых балансов (не NOCK) используем 99% от баланса
+                            adjusted_balance = score.balance * 0.99
+                            adjusted_score = PriorityScore(
+                                currency=score.currency,
+                                balance=adjusted_balance,
+                                usd_value=adjusted_balance * score.market_data.current_price,
+                                priority_score=score.priority_score,
+                                market_data=score.market_data
+                            )
+                            
+                            logging.info(f"Используем 99% от баланса для {score.currency}: {adjusted_balance:.8f} (было {score.balance:.8f})")
+                            
+                            # Исполняем торговую стратегию
+                            success = execute_trading_strategy(adjusted_score, None)
+                            
+                            if success:
+                                successful_sales += 1
+                                logging.info(f"✅ Успешно продан {score.currency}")
+                            else:
+                                failed_sales += 1
+                                logging.warning(f"❌ Не удалось продать {score.currency}")
                     else:
-                        failed_sales += 1
-                        logging.warning(f"❌ Не удалось продать {score.currency}")
+                        # Стандартная обработка для продвинутого режима
+                        # Используем 99% от баланса, чтобы избежать ошибки insufficient_balance
+                        adjusted_balance = score.balance * 0.99
+                        adjusted_score = PriorityScore(
+                            currency=score.currency,
+                            balance=adjusted_balance,
+                            usd_value=adjusted_balance * score.market_data.current_price,
+                            priority_score=score.priority_score,
+                            market_data=score.market_data
+                        )
+                        
+                        logging.info(f"Используем 99% от баланса для {score.currency}: {adjusted_balance:.8f} (было {score.balance:.8f})")
+                        
+                        ai_decision = None
+                        # Получаем решение ИИ, только если он включен и мы не в простом режиме
+                        if AI_ENABLED and not EASY_MODE and cerebras_client:
+                            ai_decision = ai_assistant.get_ai_trading_decision(
+                                adjusted_score.currency,
+                                adjusted_score.balance,
+                                adjusted_score.market_data,
+                                db_manager  # Передаем db_manager
+                            )
+                        
+                        # Исполняем торговую стратегию
+                        success = execute_trading_strategy(adjusted_score, ai_decision)
+                        
+                        if success:
+                            successful_sales += 1
+                            logging.info(f"✅ Успешно продан {score.currency}")
+                        else:
+                            failed_sales += 1
+                            logging.warning(f"❌ Не удалось продать {score.currency}")
                     
                     total_processed += 1
                     

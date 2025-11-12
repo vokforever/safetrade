@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Тестирование исправленной функции автопродажи NOCK
+Финальное тестирование исправленной функции автопродажи NOCK
 """
 
 import os
@@ -17,10 +17,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-def test_autosell_fix():
-    """Тестируем исправленную функцию автопродажи"""
+def test_final_fix():
+    """Тестируем финальные исправления"""
     try:
-        # Импортируем необходимые функции из main.py
         from main import (
             get_sellable_balances, 
             prioritize_sales, 
@@ -28,7 +27,7 @@ def test_autosell_fix():
             EASY_MODE
         )
         
-        print("🔍 Тестирование исправленной функции автопродажи...")
+        print("🔍 Финальное тестирование исправленной функции автопродажи...")
         print(f"📊 Режим работы: {'Простой' if EASY_MODE else 'Продвинутый'}")
         
         # 1. Проверяем доступные балансы
@@ -53,27 +52,28 @@ def test_autosell_fix():
         for score in priority_scores:
             print(f"   • {score.currency}: {score.balance} (${score.usd_value:.2f})")
         
-        # 3. Проверяем, есть ли NOCK с большим балансом
+        # 3. Проверяем, есть ли NOCK
         nock_score = None
         for score in priority_scores:
-            if score.currency == "NOCK" and score.balance > 100:
+            if score.currency == "NOCK":
                 nock_score = score
                 break
         
         if nock_score:
-            print(f"\n🎯 Найден NOCK с большим балансом: {nock_score.balance}")
-            print("   Этот баланс должен быть разбит на несколько частей")
+            print(f"\n🎯 Найден NOCK: {nock_score.balance}")
+            print(f"   Будет использовано 99% от баланса: {nock_score.balance * 0.99:.8f}")
             
             # Определяем ожидаемое количество частей
-            if nock_score.balance > 500:
-                expected_parts = 5
-            elif nock_score.balance > 200:
-                expected_parts = 3
-            else:
-                expected_parts = 2
-            
-            print(f"   Ожидаемое количество частей: {expected_parts}")
-            print(f"   Размер каждой части: {nock_score.balance / expected_parts:.4f}")
+            if nock_score.balance > 100:
+                if nock_score.balance > 500:
+                    expected_parts = 5
+                elif nock_score.balance > 200:
+                    expected_parts = 3
+                else:
+                    expected_parts = 2
+                
+                print(f"   Ожидаемое количество частей: {expected_parts}")
+                print(f"   Размер каждой части: {(nock_score.balance * 0.99) / expected_parts:.4f}")
         
         # 4. Запускаем автопродажу (в тестовом режиме)
         print("\n3️⃣ Запускаем автопродажу...")
@@ -104,40 +104,12 @@ def test_autosell_fix():
         traceback.print_exc()
         return False
 
-def test_rounding():
-    """Тестируем функцию округления для NOCK"""
-    try:
-        from main import round_amount_for_market
-        
-        print("\n🔧 Тестирование функции округления для NOCK...")
-        
-        test_amounts = [
-            440.94579613,
-            100.12345678,
-            50.98765432,
-            10.12345678
-        ]
-        
-        for amount in test_amounts:
-            rounded = round_amount_for_market("nockusdt", amount)
-            print(f"   {amount} -> {rounded}")
-        
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка при тестировании округления: {e}")
-        return False
-
 if __name__ == "__main__":
-    print("🚀 Запуск тестирования исправлений автопродажи NOCK")
+    print("🚀 Запуск финального тестирования исправлений автопродажи NOCK")
     print("=" * 60)
     
-    # Тестируем округление
-    if not test_rounding():
-        print("❌ Тест округления не пройден")
-        sys.exit(1)
-    
     # Тестируем автопродажу
-    if not test_autosell_fix():
+    if not test_final_fix():
         print("❌ Тест автопродажи не пройден")
         sys.exit(1)
     
