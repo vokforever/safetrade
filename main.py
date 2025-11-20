@@ -3026,7 +3026,7 @@ if bot:
 
     @bot.message_handler(commands=['history'])
     def show_history(message):
-        """Показывает историю последних сделок с использованием улучшенного форматирования"""
+        """Показывает историю последних сделок с использованием улучшенного форматирования и пагинацией"""
         try:
             bot.reply_to(message, "📊 Получаю историю сделок из SafeTrade API...")
             
@@ -3037,27 +3037,93 @@ if bot:
                 # Инициализируем TradeHistory клиент только для форматирования
                 trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
                 
-                # Используем TradeHistory для форматирования полученных данных
-                formatted_history = trade_history_client.format_trade_history(api_orders)
+                # Сохраняем все данные в кэш для последующего использования
+                if not hasattr(show_history, 'cache'):
+                    show_history.cache = {}
                 
-                if formatted_history and "❌ Нет данных" not in formatted_history:
-                    response = "📈 **История последних сделок:**\n\n"
-                    response += formatted_history
-                    bot.reply_to(message, response, parse_mode='Markdown')
-                    
-                    # Сохраняем полученные данные в базу для кэширования
-                    try:
-                        save_trade_history_to_db(trade_history_client)
-                    except Exception as e:
-                        logging.warning(f"Не удалось сохранить историю сделок в БД: {e}")
-                else:
-                    bot.reply_to(message, "❌ Не удалось отформатировать данные о сделках")
+                show_history.cache[message.chat.id] = api_orders
+                
+                # Показываем первые 5 сделок
+                display_history_page(message.chat.id, 0)
             else:
                 bot.reply_to(message, "❌ Не удалось получить историю сделок из SafeTrade API")
                     
         except Exception as e:
             logging.error(f"Ошибка при получении истории сделок: {e}")
             bot.reply_to(message, f"❌ Ошибка при получении истории сделок: {str(e)}")
+    
+    def display_history_page(chat_id, page=0):
+        """Отображает определенную страницу истории сделок"""
+        try:
+            # Получаем кэшированные данные
+            if not hasattr(show_history, 'cache') or chat_id not in show_history.cache:
+                bot.send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
+                return
+            
+            api_orders = show_history.cache[chat_id]
+            
+            # Инициализируем TradeHistory клиент только для форматирования
+            trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
+            
+            # Определяем диапазон сделок для текущей страницы
+            items_per_page = 5
+            start_idx = page * items_per_page
+            end_idx = start_idx + items_per_page
+            
+            # Получаем только нужные сделки
+            page_orders = api_orders[start_idx:end_idx]
+            
+            # Используем TradeHistory для форматирования полученных данных
+            formatted_history = trade_history_client.format_trade_history(page_orders)
+            
+            if formatted_history and "❌ Нет данных" not in formatted_history:
+                total_pages = (len(api_orders) + items_per_page - 1) // items_per_page
+                current_page = page + 1  # Для отображения человеку (начиная с 1)
+                
+                response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
+                response += formatted_history
+                
+                # Создаем клавиатуру с кнопками навигации
+                markup = types.InlineKeyboardMarkup()
+                
+                # Кнопка "Назад" (если не первая страница)
+                if page > 0:
+                    back_button = types.InlineKeyboardButton("⬅️ Назад", callback_data=f"history_page_{page-1}")
+                    markup.row(back_button)
+                
+                # Кнопка "Вперед" (если не последняя страница)
+                if end_idx < len(api_orders):
+                    forward_button = types.InlineKeyboardButton("➡️ Вперед", callback_data=f"history_page_{page+1}")
+                    if page > 0:
+                        # Если есть кнопка "Назад", добавляем "Вперед" в тот же ряд
+                        markup.add(forward_button)
+                    else:
+                        markup.row(forward_button)
+                
+                bot.send_message(chat_id, response, parse_mode='Markdown', reply_markup=markup)
+            else:
+                bot.send_message(chat_id, "❌ Не удалось отформатировать данные о сделках")
+                    
+        except Exception as e:
+            logging.error(f"Ошибка при отображении страницы истории: {e}")
+            bot.send_message(chat_id, f"❌ Ошибка при отображении истории: {str(e)}")
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('history_page_'))
+    def handle_history_navigation(call):
+        """Обработчик нажатий на кнопки навигации по истории"""
+        try:
+            # Извлекаем номер страницы из callback_data
+            page = int(call.data.split('_')[-1])
+            
+            # Обновляем сообщение с новой страницей
+            bot.answer_callback_query(call.id)
+            
+            # Отображаем новую страницу
+            display_history_page(call.message.chat.id, page)
+            
+        except Exception as e:
+            logging.error(f"Ошибка при обработке навигации по истории: {e}")
+            bot.answer_callback_query(call.id, "❌ Ошибка при навигации")
 
     @bot.message_handler(commands=['ai_status'])
     def show_ai_status(message):
