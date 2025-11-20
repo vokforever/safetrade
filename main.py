@@ -2010,13 +2010,16 @@ def round_amount_for_market(market_symbol, amount):
     """
     Округляет количество до допустимой точности для конкретной торговой пары.
     Использует информацию о точности из API рынка.
+    ✅ ИСПРАВЛЕНО: Использует округление ВНИЗ (floor) для предотвращения ошибок insufficient_balance
     """
+    import math
     try:
         # Получаем информацию о всех рынках
         markets = get_all_markets()
         if not markets:
             logging.warning(f"Не удалось получить рынки, используем стандартную точность для {market_symbol}")
-            return float(f"{amount:.4f}")  # Стандартная точность
+            # ✅ ИСПРАВЛЕНО: Используем floor для округления вниз
+            return math.floor(amount * 10**4) / 10**4  # Стандартная точность 4
         
         # Ищем информацию о нужном рынке
         market_info = None
@@ -2027,7 +2030,8 @@ def round_amount_for_market(market_symbol, amount):
         
         if not market_info:
             logging.warning(f"Не найдена информация о рынке {market_symbol}, используем стандартную точность")
-            return float(f"{amount:.4f}")  # Стандартная точность
+            # ✅ ИСПРАВЛЕНО: Используем floor для округления вниз
+            return math.floor(amount * 10**4) / 10**4  # Стандартная точность 4
         
         # Получаем точность из информации о рынке
         amount_precision = market_info.get('amount_precision', 4)
@@ -2035,24 +2039,23 @@ def round_amount_for_market(market_symbol, amount):
         
         logging.info(f"Информация о рынке {market_symbol}: точность={amount_precision}, мин. количество={min_amount}")
         
-        # Округляем до нужной точности
-        formatted_amount = f"{amount:.{amount_precision}f}"
-        rounded_amount = float(formatted_amount)
+        # ✅ ИСПРАВЛЕНО: Округляем ВНИЗ (floor) чтобы никогда не продать больше, чем есть
+        rounded_amount = math.floor(amount * 10**amount_precision) / 10**amount_precision
         
         # Проверяем, что округленная сумма не меньше минимальной
         if rounded_amount < min_amount:
             logging.warning(f"Округленная сумма {rounded_amount} меньше минимальной {min_amount}")
-            # ✅ ИСПРАВЛЕНО: Возвращаем минимальную сумму вместо None
             logging.info(f"Используем минимальную сумму {min_amount} вместо {rounded_amount}")
             return min_amount
         
-        logging.info(f"Сумма {amount} округлена до {rounded_amount} с точностью {amount_precision}")
+        logging.info(f"Сумма {amount} округлена ВНИЗ до {rounded_amount} с точностью {amount_precision}")
         return rounded_amount
         
     except Exception as e:
         logging.error(f"Ошибка при округлении суммы для {market_symbol}: {e}")
-        # В случае ошибки используем стандартную точность
-        return float(f"{amount:.4f}")
+        # В случае ошибки используем стандартную точность с floor
+        import math
+        return math.floor(amount * 10**4) / 10**4
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def create_sell_order_safetrade(market_symbol, amount, order_type="market", price=None):
@@ -2203,7 +2206,10 @@ def create_sell_order_safetrade(market_symbol, amount, order_type="market", pric
             return error_message
 
 def handle_precision_error(market_symbol, amount, order_type, price, original_error):
-    """Обрабатывает ошибку точности и пробует разные уровни точности"""
+    """Обрабатывает ошибку точности и пробует разные уровни точности
+    ✅ ИСПРАВЛЕНО: Использует округление ВНИЗ (floor) для предотвращения ошибок insufficient_balance
+    """
+    import math
     logging.warning(f"Получена ошибка точности для {market_symbol}, пробуем другие уровни точности...")
     
     try:
@@ -2217,9 +2223,8 @@ def handle_precision_error(market_symbol, amount, order_type, price, original_er
                     
                     logging.info(f"Используем точность из API: {amount_precision} знаков, мин. сумма: {min_amount}")
                     
-                    # Округляем до правильной точности
-                    formatted_amount = f"{amount:.{amount_precision}f}"
-                    new_rounded_amount = float(formatted_amount)
+                    # ✅ ИСПРАВЛЕНО: Округляем ВНИЗ (floor) чтобы никогда не продать больше, чем есть
+                    new_rounded_amount = math.floor(amount * 10**amount_precision) / 10**amount_precision
                     
                     # Проверяем, что сумма не меньше минимальной
                     if new_rounded_amount < min_amount:
@@ -2236,7 +2241,7 @@ def handle_precision_error(market_symbol, amount, order_type, price, original_er
                             order_type=order_type
                         )
                         
-                        logging.info(f"✅ Успешно создан ордер с точностью {amount_precision}")
+                        logging.info(f"✅ Успешно создан ордер с точностью {amount_precision} (округлено вниз до {new_rounded_amount})")
                         
                         # Обработка успешного результата
                         return handle_successful_order(order_details, market_symbol)
@@ -2252,9 +2257,8 @@ def handle_precision_error(market_symbol, amount, order_type, price, original_er
     
     for precision in precision_levels:
         try:
-            # Форматируем с новым уровнем точности
-            formatted_amount = f"{amount:.{precision}f}"
-            new_rounded_amount = float(formatted_amount)
+            # ✅ ИСПРАВЛЕНО: Форматируем с округлением ВНИЗ (floor)
+            new_rounded_amount = math.floor(amount * 10**precision) / 10**precision
             
             logging.info(f"Пробуем точность {precision}: {new_rounded_amount}")
             
