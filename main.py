@@ -3062,9 +3062,6 @@ if bot:
             
             api_orders = show_history.cache[chat_id]
             
-            # Инициализируем TradeHistory клиент только для форматирования
-            trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
-            
             # Определяем диапазон сделок для текущей страницы
             items_per_page = 5
             start_idx = page * items_per_page
@@ -3073,15 +3070,78 @@ if bot:
             # Получаем только нужные сделки
             page_orders = api_orders[start_idx:end_idx]
             
-            # Используем TradeHistory для форматирования полученных данных
-            formatted_history = trade_history_client.format_trade_history(page_orders)
+            # Форматируем сделки вручную для более компактного отображения
+            formatted_trades = []
+            for trade in page_orders:
+                try:
+                    # Извлекаем базовую информацию
+                    market = trade.get('market', trade.get('symbol', 'N/A')).upper()
+                    side = trade.get('side', 'N/A').title()
+                    amount = trade.get('filled_amount', trade.get('amount', '0'))
+                    price = trade.get('avg_price', trade.get('price', 'N/A'))
+                    total = trade.get('total', 'N/A')
+                    
+                    # Рассчитываем total, если не предоставлен
+                    if (total == 'N/A' or total == 0) and price != 'N/A' and amount != '0':
+                        try:
+                            total = f"{float(price) * float(amount):.2f}"
+                        except:
+                            total = 'N/A'
+                    
+                    # Форматируем время
+                    executed_at = trade.get('triggered_at', trade.get('created_at', 'N/A'))
+                    if executed_at != 'N/A':
+                        try:
+                            if isinstance(executed_at, str):
+                                if 'T' in executed_at:
+                                    timestamp = datetime.fromisoformat(executed_at.replace('Z', '+00:00'))
+                                else:
+                                    timestamp = datetime.fromtimestamp(float(executed_at))
+                            else:
+                                timestamp = executed_at
+                            
+                            executed_at = timestamp.strftime('%d.%m %H:%M')
+                        except:
+                            executed_at = str(executed_at)[:16]  # Обрезаем до разумной длины
+                    
+                    # Определяем статус
+                    state = trade.get('state', 'unknown').lower()
+                    if state == 'done':
+                        status_icon = "✅" if side.lower() == 'buy' else "❌"
+                    elif state in ['cancelled', 'cancel']:
+                        status_icon = "⚠️"
+                    else:
+                        status_icon = "❓"
+                    
+                    # Создаем компактную запись о сделке
+                    trade_entry = (
+                        f"{status_icon} *{market}*\n"
+                        f"   • {side}: {amount}\n"
+                        f"   • Цена: {price}\n"
+                        f"   • Сумма: {total} USDT\n"
+                        f"   • Время: {executed_at}"
+                    )
+                    
+                    formatted_trades.append(trade_entry)
+                    
+                except Exception as e:
+                    logging.error(f"Ошибка форматирования сделки: {e}")
+                    continue
             
-            if formatted_history and "❌ Нет данных" not in formatted_history:
+            if formatted_trades:
                 total_pages = (len(api_orders) + items_per_page - 1) // items_per_page
                 current_page = page + 1  # Для отображения человеку (начиная с 1)
                 
                 response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
-                response += formatted_history
+                response += "\n\n".join(formatted_trades)
+                
+                # Проверяем длину сообщения (Telegram API ограничение ~4096 символов)
+                if len(response) > 3800:  # Оставляем запас для разметки
+                    # Если сообщение слишком длинное, сокращаем его
+                    response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
+                    # Добавляем только первые 3 сделки
+                    response += "\n\n".join(formatted_trades[:3])
+                    response += f"\n\n... и еще {len(formatted_trades) - 3} сделок на этой странице"
                 
                 # Создаем клавиатуру с кнопками навигации
                 markup = types.InlineKeyboardMarkup()
@@ -3554,7 +3614,26 @@ def get_safetrade_order_history():
         orders = api_client.get_orders()
         
         if isinstance(orders, list) and len(orders) > 0:
-            logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров")
+            # Сортируем ордера по дате (новые первые)
+            try:
+                # Пробуем разные поля для сортировки по дате
+                orders.sort(key=lambda x: (
+                    x.get('created_at') or
+                    x.get('triggered_at') or
+                    x.get('timestamp') or
+                    '1970-01-01T00:00:00Z'
+                ), reverse=True)
+            except Exception as sort_error:
+                logging.warning(f"Не удалось отсортировать ордера по дате: {sort_error}")
+            
+            # Ограничиваем количество ордеров для предотвращения слишком длинных сообщений
+            max_orders = 50  # Максимальное количество ордеров для отображения
+            if len(orders) > max_orders:
+                orders = orders[:max_orders]
+                logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров (показаны первые {max_orders})")
+            else:
+                logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров")
+            
             return orders
         else:
             logging.warning("Получен пустой список ордеров")
