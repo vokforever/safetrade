@@ -3033,39 +3033,53 @@ if bot:
             # Используем существующую функцию get_safetrade_order_history
             api_orders = get_safetrade_order_history()
             
-            if api_orders:
-                # Инициализируем TradeHistory клиент только для форматирования
-                trade_history_client = trade_history.TradeHistory(BASE_URL, API_KEY, API_SECRET)
-                
-                # Сохраняем все данные в кэш для последующего использования
-                if not hasattr(show_history, 'cache'):
-                    show_history.cache = {}
-                
-                show_history.cache[message.chat.id] = api_orders
-                
-                # Показываем первые 5 сделок
-                display_history_page(message.chat.id, 0)
-            else:
-                bot.reply_to(message, "❌ Не удалось получить историю сделок из SafeTrade API")
+            # Инициализируем кэш для хранения данных истории
+            if not hasattr(show_history, 'cache'):
+                show_history.cache = {}
+            
+            # Сохраняем все данные в кэш для последующего использования
+            show_history.cache[message.chat.id] = {
+                'orders': api_orders,
+                'last_updated': time.time()
+            }
+            
+            # Показываем первую страницу с сделками
+            display_history_page(message.chat.id, 0)
                     
         except Exception as e:
             logging.error(f"Ошибка при получении истории сделок: {e}")
             bot.reply_to(message, f"❌ Ошибка при получении истории сделок: {str(e)}")
     
     def display_history_page(chat_id, page=0):
-        """Отображает определенную страницу истории сделок"""
+        """Отображает определенную страницу истории сделок с улучшенной обработкой длинных сообщений"""
         try:
             # Получаем кэшированные данные
             if not hasattr(show_history, 'cache') or chat_id not in show_history.cache:
                 bot.send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
                 return
             
-            api_orders = show_history.cache[chat_id]
+            cache_data = show_history.cache[chat_id]
+            api_orders = cache_data['orders']
             
-            # Определяем диапазон сделок для текущей страницы
-            items_per_page = 5
+            # Проверяем, не устарели ли данные (старше 5 минут)
+            if time.time() - cache_data['last_updated'] > 300:
+                bot.send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
+                return
+            
+            # Проверяем, есть ли ордера
+            if not api_orders or len(api_orders) == 0:
+                bot.send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
+                return
+            
+            # Уменьшаем количество элементов на странице для более компактного отображения
+            items_per_page = 3
             start_idx = page * items_per_page
             end_idx = start_idx + items_per_page
+            
+            # Проверяем, не выходит ли страница за границы
+            if start_idx >= len(api_orders):
+                bot.send_message(chat_id, f"❌ Страница {page+1} не существует. Всего страниц: {(len(api_orders) + items_per_page - 1) // items_per_page}")
+                return
             
             # Получаем только нужные сделки
             page_orders = api_orders[start_idx:end_idx]
@@ -3113,7 +3127,7 @@ if bot:
                     else:
                         status_icon = "❓"
                     
-                    # Создаем компактную запись о сделке
+                    # Создаем максимально компактную запись о сделке
                     trade_entry = (
                         f"{status_icon} *{market}*\n"
                         f"   • {side}: {amount}\n"
@@ -3132,58 +3146,188 @@ if bot:
                 total_pages = (len(api_orders) + items_per_page - 1) // items_per_page
                 current_page = page + 1  # Для отображения человеку (начиная с 1)
                 
+                # Начинаем формировать ответ
                 response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
-                response += "\n\n".join(formatted_trades)
                 
-                # Проверяем длину сообщения (Telegram API ограничение ~4096 символов)
-                if len(response) > 3800:  # Оставляем запас для разметки
-                    # Если сообщение слишком длинное, сокращаем его
-                    response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
-                    # Добавляем только первые 3 сделки
-                    response += "\n\n".join(formatted_trades[:3])
-                    response += f"\n\n... и еще {len(formatted_trades) - 3} сделок на этой странице"
+                # Добавляем сделки по одной с проверкой длины
+                for i, trade_entry in enumerate(formatted_trades):
+                    # Проверяем, не превысим ли лимит, добавив эту сделку
+                    temp_response = response + trade_entry
+                    if i < len(formatted_trades) - 1:
+                        temp_response += "\n\n"
+                    
+                    # Если добавление этой сделки превысит лимит, прерываемся
+                    if len(temp_response) > 3500:  # Оставляем запас для разметки и кнопок
+                        if i == 0:  # Если даже первая сделка не помещается
+                            response = f"📈 **История сделок (страница {current_page}/{total_pages}):**\n\n"
+                            response += trade_entry[:3000] + "...\n\n*Слишком длинная запись, сокращено*"
+                        else:
+                            response += f"\n\n... и еще {len(formatted_trades) - i} сделок на этой странице"
+                        break
+                    
+                    response = temp_response
                 
                 # Создаем клавиатуру с кнопками навигации
                 markup = types.InlineKeyboardMarkup()
                 
+                # Добавляем кнопку обновления
+                refresh_button = types.InlineKeyboardButton("🔄 Обновить", callback_data=f"history_refresh_{page}")
+                markup.row(refresh_button)
+                
+                # Кнопки навигации в одном ряду
+                nav_buttons = []
+                
                 # Кнопка "Назад" (если не первая страница)
                 if page > 0:
-                    back_button = types.InlineKeyboardButton("⬅️ Назад", callback_data=f"history_page_{page-1}")
-                    markup.row(back_button)
+                    nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"history_page_{page-1}"))
                 
                 # Кнопка "Вперед" (если не последняя страница)
                 if end_idx < len(api_orders):
-                    forward_button = types.InlineKeyboardButton("➡️ Вперед", callback_data=f"history_page_{page+1}")
-                    if page > 0:
-                        # Если есть кнопка "Назад", добавляем "Вперед" в тот же ряд
-                        markup.add(forward_button)
-                    else:
-                        markup.row(forward_button)
+                    nav_buttons.append(types.InlineKeyboardButton("➡️ Вперед", callback_data=f"history_page_{page+1}"))
                 
-                bot.send_message(chat_id, response, parse_mode='Markdown', reply_markup=markup)
+                # Добавляем кнопки навигации, если они есть
+                if nav_buttons:
+                    if len(nav_buttons) == 2:
+                        markup.row(*nav_buttons)
+                    else:
+                        markup.row(nav_buttons[0])
+                
+                safe_send_message(chat_id, response, parse_mode='Markdown', reply_markup=markup)
             else:
-                bot.send_message(chat_id, "❌ Не удалось отформатировать данные о сделках")
+                bot.send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
                     
         except Exception as e:
             logging.error(f"Ошибка при отображении страницы истории: {e}")
             bot.send_message(chat_id, f"❌ Ошибка при отображении истории: {str(e)}")
     
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('history_page_'))
+    def safe_send_message(chat_id, text, parse_mode=None, reply_markup=None):
+        """Безопасная отправка сообщения с проверкой длины и разделением при необходимости"""
+        try:
+            # Максимальная длина сообщения для Telegram API
+            MAX_LENGTH = 4096
+            
+            # Если сообщение короче лимита, отправляем как есть
+            if len(text) <= MAX_LENGTH:
+                return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+            
+            # Если сообщение слишком длинное, разбиваем его на части
+            messages = []
+            current_message = ""
+            
+            # Разделяем по абзацам
+            paragraphs = text.split('\n\n')
+            
+            for paragraph in paragraphs:
+                # Если добавление абзаца превысит лимит
+                if len(current_message) + len(paragraph) + 2 > MAX_LENGTH:
+                    if current_message:
+                        messages.append(current_message)
+                        current_message = paragraph
+                    else:
+                        # Если даже один абзац слишком длинный, разбиваем его
+                        words = paragraph.split(' ')
+                        temp_message = ""
+                        
+                        for word in words:
+                            if len(temp_message) + len(word) + 1 > MAX_LENGTH:
+                                if temp_message:
+                                    messages.append(temp_message)
+                                    temp_message = word
+                                else:
+                                    # Если даже одно слово слишком длинное, разбиваем его принудительно
+                                    while len(word) > MAX_LENGTH:
+                                        messages.append(word[:MAX_LENGTH])
+                                        word = word[MAX_LENGTH:]
+                                    temp_message = word
+                            else:
+                                if temp_message:
+                                    temp_message += " " + word
+                                else:
+                                    temp_message = word
+                        
+                        current_message = temp_message
+                else:
+                    if current_message:
+                        current_message += "\n\n" + paragraph
+                    else:
+                        current_message = paragraph
+            
+            # Добавляем последнее сообщение
+            if current_message:
+                messages.append(current_message)
+            
+            # Отправляем сообщения
+            sent_messages = []
+            for i, msg in enumerate(messages):
+                # Только первое сообщение получает клавиатуру и разметку
+                msg_parse_mode = parse_mode if i == 0 else None
+                msg_reply_markup = reply_markup if i == 0 else None
+                
+                # Добавляем индикатор продолжения для последующих сообщений
+                if i > 0:
+                    msg = f"(продолжение {i+1}/{len(messages)})\n\n{msg}"
+                
+                sent_msg = bot.send_message(chat_id, msg, parse_mode=msg_parse_mode, reply_markup=msg_reply_markup)
+                sent_messages.append(sent_msg)
+            
+            return sent_messages[0] if sent_messages else None
+            
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения: {e}")
+            # В случае ошибки, пробуем отправить укороченную версию
+            try:
+                short_text = text[:1000] + "\n\n... (сообщение слишком длинное)"
+                return bot.send_message(chat_id, short_text, parse_mode=None, reply_markup=reply_markup)
+            except:
+                return None
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('history_'))
     def handle_history_navigation(call):
         """Обработчик нажатий на кнопки навигации по истории"""
         try:
-            # Извлекаем номер страницы из callback_data
-            page = int(call.data.split('_')[-1])
+            # Извлекаем команду и параметры из callback_data
+            parts = call.data.split('_')
+            command = parts[1]  # 'page' или 'refresh'
             
-            # Обновляем сообщение с новой страницей
-            bot.answer_callback_query(call.id)
-            
-            # Отображаем новую страницу
-            display_history_page(call.message.chat.id, page)
+            if command == 'page':
+                # Навигация по страницам
+                page = int(parts[2])
+                bot.answer_callback_query(call.id)
+                display_history_page(call.message.chat.id, page)
+            elif command == 'refresh':
+                # Обновление данных истории
+                page = int(parts[2]) if len(parts) > 2 else 0
+                bot.answer_callback_query(call.id, "🔄 Обновляю историю...")
+                
+                # Получаем свежие данные
+                try:
+                    api_orders = get_safetrade_order_history()
+                    # Обновляем кэш
+                    if not hasattr(show_history, 'cache'):
+                        show_history.cache = {}
+                    
+                    show_history.cache[call.message.chat.id] = {
+                        'orders': api_orders,
+                        'last_updated': time.time()
+                    }
+                    
+                    # Отображаем страницу с обновленными данными
+                    display_history_page(call.message.chat.id, page)
+                    
+                except Exception as refresh_error:
+                    logging.error(f"Ошибка при обновлении истории: {refresh_error}")
+                    try:
+                        bot.answer_callback_query(call.id, "❌ Ошибка обновления данных")
+                        bot.send_message(call.message.chat.id, "❌ Не удалось получить обновленные данные истории")
+                    except:
+                        pass  # Если даже это не сработало, просто логируем
             
         except Exception as e:
             logging.error(f"Ошибка при обработке навигации по истории: {e}")
-            bot.answer_callback_query(call.id, "❌ Ошибка при навигации")
+            try:
+                bot.answer_callback_query(call.id, "❌ Ошибка при навигации")
+            except:
+                pass  # Если даже ответ не ушел, просто логируем
 
     @bot.message_handler(commands=['ai_status'])
     def show_ai_status(message):
@@ -3613,35 +3757,68 @@ def get_safetrade_order_history():
         # Используем новый API клиент для получения истории ордеров
         orders = api_client.get_orders()
         
-        if isinstance(orders, list) and len(orders) > 0:
-            # Сортируем ордера по дате (новые первые)
-            try:
-                # Пробуем разные поля для сортировки по дате
-                orders.sort(key=lambda x: (
-                    x.get('created_at') or
-                    x.get('triggered_at') or
-                    x.get('timestamp') or
-                    '1970-01-01T00:00:00Z'
-                ), reverse=True)
-            except Exception as sort_error:
-                logging.warning(f"Не удалось отсортировать ордера по дате: {sort_error}")
-            
-            # Ограничиваем количество ордеров для предотвращения слишком длинных сообщений
-            max_orders = 50  # Максимальное количество ордеров для отображения
-            if len(orders) > max_orders:
-                orders = orders[:max_orders]
-                logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров (показаны первые {max_orders})")
-            else:
-                logging.info(f"✅ История ордеров успешно получена: {len(orders)} ордеров")
-            
-            return orders
-        else:
-            logging.warning("Получен пустой список ордеров")
+        # Проверяем структуру ответа
+        if orders is None:
+            logging.warning("Получен None от API ордеров")
             return []
+        
+        # Обрабатываем разные форматы ответа
+        if isinstance(orders, dict):
+            # Если ответ в формате словаря, пробуем извлечь данные
+            if 'data' in orders:
+                orders = orders['data']
+            elif 'orders' in orders:
+                orders = orders['orders']
+            else:
+                logging.warning(f"Неизвестная структура ответа API: {list(orders.keys())}")
+                return []
+        
+        if not isinstance(orders, list):
+            logging.warning(f"Ожидали список ордеров, получили {type(orders)}")
+            return []
+        
+        if len(orders) == 0:
+            logging.info("Получен пустой список ордеров")
+            return []
+        
+        # Фильтруем и валидируем ордера
+        valid_orders = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            
+            # Убеждаемся, что у ордера есть базовые поля
+            if not order.get('id'):
+                continue
+            
+            valid_orders.append(order)
+        
+        # Сортируем ордера по дате (новые первые)
+        try:
+            # Пробуем разные поля для сортировки по дате
+            valid_orders.sort(key=lambda x: (
+                x.get('created_at') or
+                x.get('triggered_at') or
+                x.get('timestamp') or
+                '1970-01-01T00:00:00Z'
+            ), reverse=True)
+        except Exception as sort_error:
+            logging.warning(f"Не удалось отсортировать ордера по дате: {sort_error}")
+        
+        # Ограничиваем количество ордеров для предотвращения слишком длинных сообщений
+        max_orders = 50  # Максимальное количество ордеров для отображения
+        if len(valid_orders) > max_orders:
+            valid_orders = valid_orders[:max_orders]
+            logging.info(f"✅ История ордеров успешно получена: {len(valid_orders)} ордеров (показаны первые {max_orders})")
+        else:
+            logging.info(f"✅ История ордеров успешно получена: {len(valid_orders)} ордеров")
+        
+        return valid_orders
         
     except Exception as e:
         logging.error(f"❌ Критическая ошибка при получении истории ордеров: {e}")
-        return None
+        # Возвращаем пустой список вместо None, чтобы избежать ошибок в обработке
+        return []
 
 if __name__ == "__main__":
     main()
