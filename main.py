@@ -3219,15 +3219,33 @@ if bot:
     def show_mexc_history(message):
         """Показывает историю сделок на MEXC для конкретной монеты"""
         try:
-            # Парсим аргументы: "/history_mexc KAS" -> "KAS"
-            args = message.get_args()
-            
+            # 1. Ручной парсинг аргументов вместо message.get_args()
+            # message.text выглядит как "/history_mexc KAS"
+            try:
+                command_parts = message.text.split()
+                if len(command_parts) > 1:
+                    # Берем всё, что идет после команды, и приводим к верхнему регистру
+                    args = command_parts[1].upper()
+                else:
+                    args = None
+            except Exception:
+                args = None
+
+            # 2. Проверка наличия аргумента
             if not args:
-                bot.reply_to(message, "⚠️ Укажите монету. Пример:\n`/history_mexc KAS`", parse_mode="Markdown")
+                bot.reply_to(message, 
+                    "⚠️ **Ошибка:** Вы не указали монету.\n"
+                    "Пример использования:\n"
+                    "`/history_mexc KAS`", 
+                    parse_mode="Markdown"
+                )
                 return
 
-            bot.reply_to(message, f"🔍 Запрашиваю историю по {args.upper()}...")
+            bot.reply_to(message, f"🔍 Запрашиваю историю сделок по **{args}**...")
+            
+            # 3. Вызов функции получения истории
             report = get_mexc_history_str(coin=args)
+            
             bot.reply_to(message, report, parse_mode="Markdown")
         except Exception as e:
             logging.error(f"Ошибка в show_mexc_history: {e}")
@@ -3909,12 +3927,32 @@ def main():
             # Отправляем уведомление о запуске
             if ADMIN_CHAT_ID:
                 try:
+                    # Проверяем подключение к SafeTrade
+                    safetrade_connected = False
+                    try:
+                        if api_client:
+                            api_client.get_balances()
+                            safetrade_connected = True
+                    except:
+                        safetrade_connected = False
+                    
+                    # Проверяем подключение к MEXC
+                    mexc_connected = False
+                    try:
+                        if mexc_client:
+                            mexc_client.account.get_account_info()
+                            mexc_connected = True
+                    except:
+                        mexc_connected = False
+                    
                     startup_message = (
                         f"🚀 **SafeTrade Trading Bot успешно запущен!**\n\n"
                         f"📅 **Время запуска:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                         f"🤖 **Статус бота:** Активен\n"
                         f"🌐 **Сетевое подключение:** {'✅ OK' if check_network_connectivity() else '❌ Ошибка'}\n"
                         f"💾 **База данных:** {'✅ Подключена' if db_manager.check_connection() else '❌ Ошибка'}\n"
+                        f"🛡 **SafeTrade API:** {'✅ Подключен' if safetrade_connected else '❌ Ошибка'}\n"
+                        f"🐯 **MEXC API:** {'✅ Подключен' if mexc_connected else '❌ Отключен'}\n"
                         f"🧠 **ИИ-помощник:** {'✅ Активен' if cerebras_client else '❌ Отключен'}\n\n"
                         f"📊 **Конфигурация:**\n"
                         f"• Мин. стоимость позиции: ${MIN_POSITION_VALUE_USD}\n"
