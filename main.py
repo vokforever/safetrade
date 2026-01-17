@@ -338,6 +338,23 @@ def initialize_api_client():
 if not initialize_api_client():
     sys.exit(1)
 
+# --- ИНИЦИАЛИЗАЦИЯ MEXC КЛИЕНТА ---
+mexc_client = None
+try:
+    from mexc_api.spot import Spot
+    MEXC_API_KEY = os.getenv("MEXC_ACCESSKEY")
+    MEXC_SECRET_KEY = os.getenv("MEXC_SECRETKEY")
+    
+    if MEXC_API_KEY and MEXC_SECRET_KEY:
+        mexc_client = Spot(api_key=MEXC_API_KEY, api_secret=MEXC_SECRET_KEY)
+        logging.info("✅ MEXC клиент инициализирован")
+    else:
+        logging.info("ℹ️ MEXC API ключи не настроены. Команды /balance_mexc и /balance будут работать только с SafeTrade.")
+except ImportError:
+    logging.warning("⚠️ Библиотека mexc_api не установлена. Установите её: pip install mexc-api")
+except Exception as e:
+    logging.error(f"❌ Ошибка инициализации MEXC клиента: {e}")
+
 # Настройки из конфигурации с приоритетом переменных окружения
 EASY_MODE = EASY_MODE_ENV if EASY_MODE_ENV is not None else CONFIG['main']['easy_mode']
 AI_ENABLED = AI_ENABLED_ENV if AI_ENABLED_ENV is not None else CONFIG['main']['ai_enabled']
@@ -911,8 +928,8 @@ else:
 
 # Настраиваем клавиатуру с командами
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-menu_markup.row('/balance', '/sell_all')
-menu_markup.row('/history', '/ai_status')
+menu_markup.row('/balance', '/balance_sf', '/balance_mexc')
+menu_markup.row('/sell_all', '/history', '/ai_status')
 menu_markup.row('/markets', '/config')
 menu_markup.row('/donate', '/help')
 menu_markup.row('/health', '/test_api')
@@ -1278,6 +1295,73 @@ def get_all_balances():
     except Exception as e:
         logging.error(f"Ошибка при получении всех балансов: {e}")
         return None
+
+# --- ФУНКЦИИ ДЛЯ ПОЛУЧЕНИЯ БАЛАНСОВ С ОБЕИХ БИРЖ ---
+
+def get_mexc_balance_str():
+    """Получает и форматирует баланс с биржи MEXC."""
+    try:
+        # Проверяем, инициализирован ли MEXC клиент
+        if 'mexc_client' not in globals() or mexc_client is None:
+            return "⚠️ MEXC клиент не инициализирован. Проверьте переменные окружения MEXC_ACCESSKEY и MEXC_SECRETKEY."
+        
+        # Получаем данные аккаунта
+        info = mexc_client.account.get_account_info()
+        
+        # Фильтруем нулевые балансы
+        balances = [b for b in info.get('balances', []) if float(b.get('free', 0)) > 0 or float(b.get('locked', 0)) > 0]
+        
+        if not balances:
+            return "🏦 **Баланс MEXC:**\n   Баланс пуст."
+        
+        msg = "🏦 **Баланс MEXC:**\n"
+        for b in balances:
+            # Форматируем, убирая лишние нули
+            free = float(b.get('free', 0))
+            locked = float(b.get('locked', 0))
+            total = free + locked
+            # Выводим актив, если его значимое количество
+            if total > 0:
+                msg += f"- **{b.get('asset')}**: {total:.4f}"
+                if locked > 0:
+                    msg += f" (Locked: {locked:.4f})"
+                msg += "\n"
+        return msg
+    except Exception as e:
+        logging.error(f"Ошибка получения баланса MEXC: {e}")
+        return f"⚠️ Ошибка MEXC: {str(e)}"
+
+def get_sf_balance_str():
+    """Получает и форматирует баланс с биржи SafeTrade."""
+    try:
+        # Проверяем, инициализирован ли API клиент
+        if 'api_client' not in globals() or api_client is None:
+            return "⚠️ SafeTrade клиент не инициализирован."
+        
+        # Получаем балансы через существующий API клиент
+        balances = api_client.get_balances()
+        
+        if not balances or not isinstance(balances, list):
+            return "🛡 **Баланс SafeTrade:**\n   Баланс пуст или ошибка получения данных."
+        
+        # Фильтруем только ненулевые балансы
+        active_balances = {}
+        for balance in balances:
+            currency = balance.get('currency', '').upper()
+            balance_amount = float(balance.get('balance', 0))
+            if balance_amount > 0:
+                active_balances[currency] = balance_amount
+        
+        if not active_balances:
+            return "🛡 **Баланс SafeTrade:**\n   Баланс пуст."
+        
+        msg = "🛡 **Баланс SafeTrade:**\n"
+        for coin, amount in active_balances.items():
+            msg += f"- **{coin}**: {amount:.8f}\n"
+        return msg
+    except Exception as e:
+        logging.error(f"Ошибка получения баланса SafeTrade: {e}")
+        return f"⚠️ Ошибка SafeTrade: {str(e)}"
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_sellable_balances():
@@ -2849,7 +2933,9 @@ if bot:
 🤖 **Добро пожаловать в SafeTrade Trading Bot!**
 Этот бот поможет вам автоматизировать торговлю криптовалютами на бирже SafeTrade.
 **Доступные команды:**
-• `/balance` - показать текущие балансы
+• `/balance` - показать сводный баланс по обеим биржам
+• `/balance_sf` - показать баланс только SafeTrade
+• `/balance_mexc` - показать баланс только MEXC
 • `/sell_all` - продать все альткоины за USDT
 • `/history` - показать историю сделок
 • `/ai_status` - статус ИИ-помощника
@@ -2917,50 +3003,23 @@ if bot:
 
     @bot.message_handler(commands=['balance'])
     def show_balance(message):
-        """Показывает текущие балансы"""
+        """Показывает сводный баланс с обеих бирж (SafeTrade + MEXC)"""
         try:
-            # Получаем все балансы (включая исключенные валюты)
-            all_balances = get_all_balances()
-            if not all_balances:
-                bot.reply_to(message, "❌ Нет балансов для отображения или ошибка получения данных")
-                return
+            bot.reply_to(message, "🔍 Сбор данных по всем биржам...")
             
-            # Форматируем ответ с отображением всех балансов
-            response = "💰 *Ваши балансы:*\n\n"
-            total_usd = 0
-            displayed_balances = []
+            # Собираем данные с обеих бирж
+            sf_report = get_sf_balance_str()
+            mexc_report = get_mexc_balance_str()
             
-            # Сначала показываем USDT отдельно
-            usdt_balance = all_balances.get('USDT', 0)
-            if usdt_balance > 0:
-                response += f"🔹 *USDT*\n   • Количество: `{usdt_balance:.8f}`\n\n"
+            # Формируем общий ответ
+            full_report = (
+                "📊 **ОБЩИЙ БАЛАНС** 📊\n\n"
+                f"{sf_report}\n"
+                f"{'-'*20}\n"
+                f"{mexc_report}"
+            )
             
-            # Затем показываем остальные балансы с приоритетом продажи
-            priority_scores = prioritize_sales({k: v for k, v in all_balances.items() if k != 'USDT' and k not in EXCLUDED_CURRENCIES and v > 0})
-            
-            if priority_scores:
-                for i, score in enumerate(priority_scores, 1):
-                    total_usd += score.usd_value
-                    # Escape special Markdown characters
-                    currency = str(score.currency).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
-                    response += (
-                        f"{i}. *{currency}*\n"
-                        f"   • Количество: `{score.balance:.8f}`\n"
-                        f"   • Цена: `${score.market_data.current_price:.6f}`\n"
-                        f"   • Стоимость: `${score.usd_value:.2f}`\n"
-                        f"   • Приоритет: `{score.priority_score:.3f}`\n"
-                        f"   • Волатильность: `{score.market_data.volatility:.4f}`\n\n"
-                    )
-            else:
-                # Если нет приоритетных балансов, просто показываем остальные
-                for currency, balance in all_balances.items():
-                    if currency != 'USDT' and currency not in EXCLUDED_CURRENCIES and balance > 0:
-                        response += f"🔹 *{currency}*\n   • Количество: `{balance:.8f}`\n\n"
-            
-            # Добавляем общую стоимость (без учета USDT)
-            response += f"💵 *Общая стоимость активов: ${total_usd:.2f}*"
-            
-            bot.reply_to(message, response, parse_mode='Markdown')
+            bot.reply_to(message, full_report, parse_mode='Markdown')
         
         except Exception as e:
             logging.error(f"Ошибка в show_balance: {e}")
@@ -2990,6 +3049,28 @@ if bot:
             logging.error(f"Ошибка в show_usdt_balance: {e}")
             bot.reply_to(message, f"❌ Ошибка получения баланса USDT: {e}")
     
+    @bot.message_handler(commands=['balance_mexc'])
+    def show_mexc_balance(message):
+        """Показывает баланс только с биржи MEXC"""
+        try:
+            bot.reply_to(message, "🔍 Запрашиваю баланс MEXC...")
+            report = get_mexc_balance_str()
+            bot.reply_to(message, report, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка в show_mexc_balance: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения баланса MEXC: {e}")
+
+    @bot.message_handler(commands=['balance_sf'])
+    def show_sf_balance(message):
+        """Показывает баланс только с биржи SafeTrade"""
+        try:
+            bot.reply_to(message, "🔍 Запрашиваю баланс SafeTrade...")
+            report = get_sf_balance_str()
+            bot.reply_to(message, report, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка в show_sf_balance: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения баланса SafeTrade: {e}")
+
     @bot.message_handler(commands=['sell_all'])
     def sell_all_altcoins(message):
         """Продает все альткоины"""
@@ -3028,7 +3109,7 @@ if bot:
     def show_history(message):
         """Показывает историю последних сделок с использованием улучшенного форматирования и пагинацией"""
         try:
-            bot.reply_to(message, "📊 Получаю историю сделок из SafeTrade API...")
+            safe_send_message(message.chat.id, "📊 Получаю историю сделок из SafeTrade API...")
             
             # Используем существующую функцию get_safetrade_order_history
             api_orders = get_safetrade_order_history()
@@ -3045,17 +3126,17 @@ if bot:
             
             # Показываем первую страницу с сделками
             display_history_page(message.chat.id, 0)
-                    
+                     
         except Exception as e:
             logging.error(f"Ошибка при получении истории сделок: {e}")
-            bot.reply_to(message, f"❌ Ошибка при получении истории сделок: {str(e)}")
+            safe_send_message(message.chat.id, f"❌ Ошибка при получении истории сделок: {str(e)}")
     
     def display_history_page(chat_id, page=0):
         """Отображает определенную страницу истории сделок с улучшенной обработкой длинных сообщений"""
         try:
             # Получаем кэшированные данные
             if not hasattr(show_history, 'cache') or chat_id not in show_history.cache:
-                bot.send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
+                safe_send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
                 return
             
             cache_data = show_history.cache[chat_id]
@@ -3063,12 +3144,12 @@ if bot:
             
             # Проверяем, не устарели ли данные (старше 5 минут)
             if time.time() - cache_data['last_updated'] > 300:
-                bot.send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
+                safe_send_message(chat_id, "❌ Данные истории устарели. Используйте /history снова.")
                 return
             
             # Проверяем, есть ли ордера
             if not api_orders or len(api_orders) == 0:
-                bot.send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
+                safe_send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
                 return
             
             # Уменьшаем количество элементов на странице для более компактного отображения
@@ -3078,7 +3159,7 @@ if bot:
             
             # Проверяем, не выходит ли страница за границы
             if start_idx >= len(api_orders):
-                bot.send_message(chat_id, f"❌ Страница {page+1} не существует. Всего страниц: {(len(api_orders) + items_per_page - 1) // items_per_page}")
+                safe_send_message(chat_id, f"❌ Страница {page+1} не существует. Всего страниц: {(len(api_orders) + items_per_page - 1) // items_per_page}")
                 return
             
             # Получаем только нужные сделки
@@ -3194,11 +3275,11 @@ if bot:
                 
                 safe_send_message(chat_id, response, parse_mode='Markdown', reply_markup=markup)
             else:
-                bot.send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
+                safe_send_message(chat_id, "📊 **История сделок пуста**\n\nУ вас пока нет совершенных сделок.", parse_mode='Markdown')
                     
         except Exception as e:
             logging.error(f"Ошибка при отображении страницы истории: {e}")
-            bot.send_message(chat_id, f"❌ Ошибка при отображении истории: {str(e)}")
+            safe_send_message(chat_id, f"❌ Ошибка при отображении истории: {str(e)}")
     
     def safe_send_message(chat_id, text, parse_mode=None, reply_markup=None):
         """Безопасная отправка сообщения с проверкой длины и разделением при необходимости"""
@@ -3318,7 +3399,7 @@ if bot:
                     logging.error(f"Ошибка при обновлении истории: {refresh_error}")
                     try:
                         bot.answer_callback_query(call.id, "❌ Ошибка обновления данных")
-                        bot.send_message(call.message.chat.id, "❌ Не удалось получить обновленные данные истории")
+                        safe_send_message(call.message.chat.id, "❌ Не удалось получить обновленные данные истории")
                     except:
                         pass  # Если даже это не сработало, просто логируем
             
