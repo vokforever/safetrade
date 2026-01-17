@@ -21,3 +21,6 @@ gunicorn>=21.0.0
 
 # --- Implicit dependency ---
 pytz>=2023.3
+
+# --- MEXC SDK ---
+mexc-api>=0.0.2
