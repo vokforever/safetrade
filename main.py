@@ -34,7 +34,7 @@ import socket
 import subprocess
 from urllib.parse import urlparse
 import trade_history
-import binascii  # Add this import for the fixed signature generation
+import binascii
 
 # --- SAFE TRADE API КЛИЕНТ ---
 class SafeTradeAPI:
