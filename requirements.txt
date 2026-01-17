@@ -23,4 +23,4 @@ gunicorn>=21.0.0
 pytz>=2023.3
 
 # --- MEXC SDK ---
-mexc-api>=0.0.2
+mexc-api>=0.0.3
