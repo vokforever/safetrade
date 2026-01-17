@@ -930,6 +930,7 @@ else:
 menu_markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
 menu_markup.row('/balance', '/balance_sf', '/balance_mexc')
 menu_markup.row('/sell_all', '/history', '/ai_status')
+menu_markup.row('/history_sf', '/history_mexc')
 menu_markup.row('/markets', '/config')
 menu_markup.row('/donate', '/help')
 menu_markup.row('/health', '/test_api')
@@ -1362,6 +1363,113 @@ def get_sf_balance_str():
     except Exception as e:
         logging.error(f"Ошибка получения баланса SafeTrade: {e}")
         return f"⚠️ Ошибка SafeTrade: {str(e)}"
+
+def get_mexc_history_str(coin: str = None):
+    """Получает и форматирует историю сделок с биржи MEXC для конкретной монеты."""
+    if not coin:
+        return "⚠️ Для MEXC необходимо указать монету. Пример: `/history_mexc KAS`"
+    
+    symbol = f"{coin.upper()}USDT"
+    
+    try:
+        # Проверяем, инициализирован ли MEXC клиент
+        if 'mexc_client' not in globals() or mexc_client is None:
+            return "⚠️ MEXC клиент не инициализирован. Проверьте переменные окружения MEXC_ACCESSKEY и MEXC_SECRETKEY."
+        
+        # Получаем историю сделок через accountTradeList
+        trades = mexc_client.accountTradeList(symbol=symbol, options={'limit': 5})
+        
+        # Проверка на пустой ответ
+        if not trades or len(trades) == 0:
+            return f"📜 История {symbol} пуста."
+
+        msg = f"📜 **Последние сделки {symbol} (MEXC):**\n"
+        
+        # Сортируем от новых к старым
+        for t in reversed(trades):
+            # Конвертация времени
+            dt_obj = datetime.fromtimestamp(int(t['time']) / 1000)
+            date_str = dt_obj.strftime('%d.%m %H:%M')
+            
+            side = "🟢 BUY" if t['isBuyer'] else "🔴 SELL"
+            price = float(t['price'])
+            qty = float(t['qty'])
+            total = price * qty
+            
+            msg += f"`{date_str}` {side} | **{qty}** по {price}\n"
+            
+        return msg
+
+    except Exception as e:
+        return f"⚠️ Ошибка получения истории MEXC для {symbol}: {str(e)}"
+
+def get_sf_history_str():
+    """Получает и форматирует историю сделок с биржи SafeTrade."""
+    try:
+        # Получаем историю ордеров через существующую функцию
+        orders = get_safetrade_order_history()
+        
+        if not orders or len(orders) == 0:
+            return "📜 **История SafeTrade пуста**\n\nУ вас пока нет совершенных сделок."
+        
+        msg = "📜 **Последние сделки (SafeTrade):**\n"
+        
+        # Показываем первые 5 сделок для краткости
+        for order in orders[:5]:
+            try:
+                market = order.get('market', order.get('symbol', 'N/A')).upper()
+                side = order.get('side', 'N/A').title()
+                amount = order.get('filled_amount', order.get('amount', '0'))
+                price = order.get('avg_price', order.get('price', 'N/A'))
+                total = order.get('total', 'N/A')
+                
+                # Рассчитываем total, если не предоставлен
+                if (total == 'N/A' or total == 0) and price != 'N/A' and amount != '0':
+                    try:
+                        total = f"{float(price) * float(amount):.2f}"
+                    except:
+                        total = 'N/A'
+                
+                # Форматируем время
+                executed_at = order.get('triggered_at', order.get('created_at', 'N/A'))
+                if executed_at != 'N/A':
+                    try:
+                        if isinstance(executed_at, str):
+                            if 'T' in executed_at:
+                                timestamp = datetime.fromisoformat(executed_at.replace('Z', '+00:00'))
+                            else:
+                                timestamp = datetime.fromtimestamp(float(executed_at))
+                        else:
+                            timestamp = executed_at
+                        
+                        executed_at = timestamp.strftime('%d.%m %H:%M')
+                    except:
+                        executed_at = str(executed_at)[:16]
+                
+                # Определяем статус
+                state = order.get('state', 'unknown').lower()
+                if state == 'done':
+                    status_icon = "✅" if side.lower() == 'buy' else "❌"
+                elif state in ['cancelled', 'cancel']:
+                    status_icon = "⚠️"
+                else:
+                    status_icon = "❓"
+                
+                msg += f"{status_icon} *{market}*\n"
+                msg += f"   • {side}: {amount}\n"
+                msg += f"   • Цена: {price}\n"
+                msg += f"   • Сумма: {total} USDT\n"
+                msg += f"   • Время: {executed_at}\n\n"
+                
+            except Exception as e:
+                logging.error(f"Ошибка форматирования сделки: {e}")
+                continue
+        
+        return msg
+        
+    except Exception as e:
+        logging.error(f"Ошибка получения истории SafeTrade: {e}")
+        return f"⚠️ Ошибка получения истории SafeTrade: {str(e)}"
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 def get_sellable_balances():
@@ -2937,7 +3045,9 @@ if bot:
 • `/balance_sf` - показать баланс только SafeTrade
 • `/balance_mexc` - показать баланс только MEXC
 • `/sell_all` - продать все альткоины за USDT
-• `/history` - показать историю сделок
+• `/history` - показать сводную историю сделок
+• `/history_sf` - показать историю сделок SafeTrade
+• `/history_mexc <COIN>` - показать историю сделок MEXC для монеты
 • `/ai_status` - статус ИИ-помощника
 • `/markets` - показать доступные торговые пары
 • `/config` - показать текущую конфигурацию
@@ -3105,31 +3215,57 @@ if bot:
             logging.error(f"Ошибка в sell_all_altcoins: {e}")
             bot.reply_to(message, f"❌ Ошибка запуска автопродажи: {e}")
 
+    @bot.message_handler(commands=['history_mexc'])
+    def show_mexc_history(message):
+        """Показывает историю сделок на MEXC для конкретной монеты"""
+        try:
+            # Парсим аргументы: "/history_mexc KAS" -> "KAS"
+            args = message.get_args()
+            
+            if not args:
+                bot.reply_to(message, "⚠️ Укажите монету. Пример:\n`/history_mexc KAS`", parse_mode="Markdown")
+                return
+
+            bot.reply_to(message, f"🔍 Запрашиваю историю по {args.upper()}...")
+            report = get_mexc_history_str(coin=args)
+            bot.reply_to(message, report, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка в show_mexc_history: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения истории MEXC: {e}")
+
+    @bot.message_handler(commands=['history_sf'])
+    def show_sf_history(message):
+        """Показывает историю сделок на SafeTrade"""
+        try:
+            bot.reply_to(message, "🔍 Запрашиваю историю SafeTrade...")
+            report = get_sf_history_str()
+            bot.reply_to(message, report, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Ошибка в show_sf_history: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения истории SafeTrade: {e}")
+
     @bot.message_handler(commands=['history'])
     def show_history(message):
-        """Показывает историю последних сделок с использованием улучшенного форматирования и пагинацией"""
+        """Показывает сводную историю сделок (SafeTrade + подсказка по MEXC)"""
         try:
-            safe_send_message(message.chat.id, "📊 Получаю историю сделок из SafeTrade API...")
+            bot.reply_to(message, "⏳ Получение сводки истории...")
             
-            # Используем существующую функцию get_safetrade_order_history
-            api_orders = get_safetrade_order_history()
+            # 1. История SafeTrade
+            sf_report = get_sf_history_str()
             
-            # Инициализируем кэш для хранения данных истории
-            if not hasattr(show_history, 'cache'):
-                show_history.cache = {}
+            # 2. Заглушка для MEXC
+            mexc_note = (
+                "🐯 **MEXC:**\n"
+                "API требует указать конкретную пару.\n"
+                "Используйте команду: `/history_mexc <COIN>`"
+            )
             
-            # Сохраняем все данные в кэш для последующего использования
-            show_history.cache[message.chat.id] = {
-                'orders': api_orders,
-                'last_updated': time.time()
-            }
+            full_report = f"{sf_report}\n{'-'*20}\n{mexc_note}"
             
-            # Показываем первую страницу с сделками
-            display_history_page(message.chat.id, 0)
-                     
+            bot.reply_to(message, full_report, parse_mode="Markdown")
         except Exception as e:
-            logging.error(f"Ошибка при получении истории сделок: {e}")
-            safe_send_message(message.chat.id, f"❌ Ошибка при получении истории сделок: {str(e)}")
+            logging.error(f"Ошибка в show_history: {e}")
+            bot.reply_to(message, f"❌ Ошибка получения истории: {e}")
     
     def display_history_page(chat_id, page=0):
         """Отображает определенную страницу истории сделок с улучшенной обработкой длинных сообщений"""
